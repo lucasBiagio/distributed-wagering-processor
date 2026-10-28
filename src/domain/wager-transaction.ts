@@ -246,7 +246,7 @@ export class WagerTransaction {
           WagerTransactionKind.Win,
           WagerTransactionKind.Refund,
         ]);
-        return reference!.ledgerDirectionFor() === LedgerDirection.Debit
+        return reference!.kind === WagerTransactionKind.Bet
           ? LedgerDirection.Credit
           : LedgerDirection.Debit;
     }

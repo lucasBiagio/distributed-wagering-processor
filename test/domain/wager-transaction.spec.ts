@@ -29,6 +29,32 @@ function createBet(): WagerTransaction {
   });
 }
 
+function createTransaction(props: {
+  id: string;
+  externalTransactionId: string;
+  kind: WagerTransactionKind;
+  amount?: string;
+  referenceExternalTransactionId?: string;
+}): WagerTransaction {
+  return WagerTransaction.create({
+    id: props.id,
+    providerId: 'provider-a',
+    externalTransactionId: props.externalTransactionId,
+    idempotencyKey: `provider-a:${props.externalTransactionId}`,
+    payloadHash: `hash-${props.id}`,
+    walletId: 'wallet-1',
+    playerId: 'player-1',
+    roundId: 'round-1',
+    gameId: 'game-1',
+    kind: props.kind,
+    money: Money.from({ amount: props.amount ?? '25.00', currency: 'BRL' }),
+    ...(props.referenceExternalTransactionId === undefined
+      ? {}
+      : { referenceExternalTransactionId: props.referenceExternalTransactionId }),
+    createdAt: at,
+  });
+}
+
 describe('WagerTransaction', () => {
   test('creates a pending BET and permits its one-way processed transition', () => {
     const transaction = createBet();
@@ -44,5 +70,72 @@ describe('WagerTransaction', () => {
     expect(() => transaction.fail(FailureCode.InfrastructureFailure)).toThrow(
       new InvalidTransactionStateError(WagerTransactionStatus.Processed),
     );
+  });
+
+  test('derives rollback directions without recursively resolving a refund reference', () => {
+    const bet = createBet();
+    bet.markProcessed(undefined, at);
+
+    const win = createTransaction({ id: 'win-1', externalTransactionId: 'win-external-1', kind: WagerTransactionKind.Win });
+    win.markProcessed(undefined, at);
+
+    const refund = createTransaction({
+      id: 'refund-1',
+      externalTransactionId: 'refund-external-1',
+      kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: 'external-1',
+    });
+    refund.markProcessed('transaction-1', at);
+
+    const rollbackBet = createTransaction({
+      id: 'rollback-bet-1',
+      externalTransactionId: 'rollback-bet-external-1',
+      kind: WagerTransactionKind.Rollback,
+      referenceExternalTransactionId: 'external-1',
+    });
+    const rollbackWin = createTransaction({
+      id: 'rollback-win-1',
+      externalTransactionId: 'rollback-win-external-1',
+      kind: WagerTransactionKind.Rollback,
+      referenceExternalTransactionId: 'win-external-1',
+    });
+    const rollbackRefund = createTransaction({
+      id: 'rollback-refund-1',
+      externalTransactionId: 'rollback-refund-external-1',
+      kind: WagerTransactionKind.Rollback,
+      referenceExternalTransactionId: 'refund-external-1',
+    });
+
+    expect(rollbackBet.ledgerDirectionFor(bet)).toBe(LedgerDirection.Credit);
+    expect(rollbackWin.ledgerDirectionFor(win)).toBe(LedgerDirection.Debit);
+    expect(rollbackRefund.ledgerDirectionFor(refund)).toBe(LedgerDirection.Debit);
+  });
+
+  test('rejects rollback references with an incompatible amount or unresolved state', () => {
+    const reference = createBet();
+    const rollback = createTransaction({
+      id: 'rollback-1',
+      externalTransactionId: 'rollback-external-1',
+      kind: WagerTransactionKind.Rollback,
+      amount: '20.00',
+      referenceExternalTransactionId: 'external-1',
+    });
+
+    expect(() => rollback.ledgerDirectionFor(reference)).toThrow('Reference transaction must be processed');
+
+    reference.markProcessed(undefined, at);
+    expect(() => rollback.ledgerDirectionFor(reference)).toThrow('Reversal amount must equal its reference amount');
+  });
+
+  test('accepts zero-value LOSS consistently as a non-balance operation', () => {
+    const loss = createTransaction({
+      id: 'loss-1',
+      externalTransactionId: 'loss-external-1',
+      kind: WagerTransactionKind.Loss,
+      amount: '0.00',
+    });
+
+    expect(loss.affectsBalance()).toBe(false);
+    expect(() => loss.ledgerDirectionFor()).toThrow('LOSS transactions do not produce ledger entries');
   });
 });

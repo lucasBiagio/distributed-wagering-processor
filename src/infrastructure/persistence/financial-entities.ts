@@ -28,6 +28,7 @@ export class WagerTransactionRecord {
   public status!: string;
   public failureCode!: string | null;
   public processedAt!: Date | null;
+  public resultingBalance!: string | null;
   public createdAt!: Date;
 }
 
@@ -97,6 +98,7 @@ export const WagerTransactionRecordSchema = new EntitySchema<WagerTransactionRec
     status: { type: String },
     failureCode: { type: String, fieldName: 'failure_code', nullable: true },
     processedAt: { type: Date, fieldName: 'processed_at', nullable: true },
+    resultingBalance: { type: new DecimalType('string'), fieldName: 'resulting_balance', precision: 20, scale: 2, nullable: true },
     createdAt: { type: Date, fieldName: 'created_at' },
   },
 });

@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MikroORM } from '@mikro-orm/core';
 import { PostgreSqlDriver } from '@mikro-orm/postgresql';
 
-import { WalletRecord } from '../../src/infrastructure/persistence/financial-entities.js';
+import { WalletRecord, WagerTransactionRecord } from '../../src/infrastructure/persistence/financial-entities.js';
 import config from '../../src/infrastructure/persistence/mikro-orm.config.js';
 
 let orm: MikroORM<PostgreSqlDriver>;
@@ -59,7 +59,7 @@ async function expectSqlState(
 async function insertWalletAndTransaction(
   seed: string,
   status: 'PENDING' | 'PENDING_REFERENCE' | 'PROCESSED',
-): Promise<{ walletId: string; transactionId: string }> {
+): Promise<{ walletId: string; playerId: string; transactionId: string }> {
   const walletId = `00000000-0000-0000-0000-000000000${seed}`;
   const playerId = `00000000-0000-0000-0000-000000000${Number(seed) + 10}`;
   const transactionId = `00000000-0000-0000-0000-000000000${Number(seed) + 20}`;
@@ -81,7 +81,7 @@ async function insertWalletAndTransaction(
     );
   `);
 
-  return { walletId, transactionId };
+  return { walletId, playerId, transactionId };
 }
 
 describe('financial schema migration', () => {
@@ -181,6 +181,19 @@ describe('financial schema migration', () => {
 
     const rehydrated = await em.findOneOrFail(WalletRecord, record.id);
     expect(rehydrated.balance).toBe('90071992547409.91');
+  });
+
+  test('preserves the historical resulting balance as an exact string through the MikroORM mapping', async () => {
+    const { transactionId } = await insertWalletAndTransaction('299', 'PENDING');
+    await orm.em.getConnection().execute(`
+      update wager_transactions
+      set status = 'PROCESSED', processed_at = now(), resulting_balance = 90071992547409.91
+      where id = '${transactionId}';
+    `);
+
+    const em = orm.em.fork();
+    const rehydrated = await em.findOneOrFail(WagerTransactionRecord, transactionId);
+    expect(rehydrated.resultingBalance).toBe('90071992547409.91');
   });
 
   test('does not increment a wallet version for a non-financial MikroORM update', async () => {
@@ -485,9 +498,8 @@ describe('financial schema migration', () => {
     });
   });
 
-  test('blocks a second processed reversal of the same kind for one reference transaction', async () => {
+  test('blocks every second processed economic reversal of a BET while permitting rollback of its REFUND', async () => {
     const reference = await insertWalletAndTransaction('110', 'PROCESSED');
-    const playerId = '00000000-0000-0000-0000-000000000120';
 
     await orm.em.getConnection().execute(`
       insert into wager_transactions (
@@ -496,7 +508,7 @@ describe('financial schema migration', () => {
         reference_transaction_id, reference_external_transaction_id, status, processed_at, created_at
       ) values (
         '00000000-0000-0000-0000-000000000180', 'provider-110', 'external-refund-110a',
-        'provider-110:external-refund-110a', 'payload-refund-110a', '${reference.walletId}', '${playerId}',
+        'provider-110:external-refund-110a', 'payload-refund-110a', '${reference.walletId}', '${reference.playerId}',
         'round-110', 'game-110', 'REFUND', 10.00, 'BRL', '${reference.transactionId}', 'external-bet-110', 'PROCESSED', now(), now()
       );
     `);
@@ -507,10 +519,128 @@ describe('financial schema migration', () => {
         wallet_id, player_id, round_id, game_id, kind, amount, currency,
         reference_transaction_id, reference_external_transaction_id, status, processed_at, created_at
       ) values (
-        '00000000-0000-0000-0000-000000000181', 'provider-110', 'external-refund-110b',
-        'provider-110:external-refund-110b', 'payload-refund-110b', '${reference.walletId}', '${playerId}',
-        'round-110', 'game-110', 'REFUND', 10.00, 'BRL', '${reference.transactionId}', 'external-bet-110', 'PROCESSED', now(), now()
+        '00000000-0000-0000-0000-000000000181', 'provider-110', 'external-rollback-bet-110',
+        'provider-110:external-rollback-bet-110', 'payload-rollback-bet-110', '${reference.walletId}', '${reference.playerId}',
+        'round-110', 'game-110', 'ROLLBACK', 10.00, 'BRL', '${reference.transactionId}', 'external-bet-110', 'PROCESSED', now(), now()
       );
-    `, '23505');
+    `, '23505', 'wager_transactions_processed_economic_reversal_unique');
+
+    await orm.em.getConnection().execute(`
+      insert into wager_transactions (
+        id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+        wallet_id, player_id, round_id, game_id, kind, amount, currency,
+        reference_transaction_id, reference_external_transaction_id, status, processed_at, created_at
+      ) values (
+        '00000000-0000-0000-0000-000000000182', 'provider-110', 'external-rollback-refund-110',
+        'provider-110:external-rollback-refund-110', 'payload-rollback-refund-110', '${reference.walletId}', '${reference.playerId}',
+        'round-110', 'game-110', 'ROLLBACK', 10.00, 'BRL',
+        '00000000-0000-0000-0000-000000000180', 'external-refund-110a', 'PROCESSED', now(), now()
+      );
+    `);
+  });
+
+  test('requires a resolved reference before a REFUND or ROLLBACK can be processed', async () => {
+    const pending = await insertWalletAndTransaction('116', 'PENDING');
+
+    await orm.em.getConnection().execute(`
+      insert into wager_transactions (
+        id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+        wallet_id, player_id, round_id, game_id, kind, amount, currency,
+        reference_external_transaction_id, status, created_at
+      ) values (
+        '00000000-0000-0000-0000-000000000183', 'provider-111', 'external-refund-111',
+        'provider-111:external-refund-111', 'payload-refund-111', '${pending.walletId}', '${pending.playerId}',
+        'round-111', 'game-111', 'REFUND', 10.00, 'BRL', 'external-bet-111', 'PENDING', now()
+      );
+    `);
+
+    await expectSqlState(`
+      update wager_transactions
+      set status = 'PROCESSED', processed_at = now()
+      where id = '00000000-0000-0000-0000-000000000183'
+    `, '23514', 'wager_transactions_processed_reversal_reference_required');
+  });
+
+  test('enforces ledger wallet, currency, amount, direction, and LOSS consistency against its transaction', async () => {
+    const transaction = await insertWalletAndTransaction('112', 'PROCESSED');
+    const otherWalletId = '00000000-0000-0000-0000-000000000184';
+    await orm.em.getConnection().execute(`
+      insert into wallets (id, player_id, currency, balance, created_at, updated_at)
+      values ('${otherWalletId}', '00000000-0000-0000-0000-000000000194', 'BRL', 100.00, now(), now());
+    `);
+
+    await expectSqlState(`
+      insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+      values ('00000000-0000-0000-0000-000000000185', '${otherWalletId}', '${transaction.transactionId}', 'DEBIT', 10.00, 'BRL', 100.00, 90.00, now())
+    `, '23503');
+    await expectSqlState(`
+      insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+      values ('00000000-0000-0000-0000-000000000186', '${transaction.walletId}', '${transaction.transactionId}', 'DEBIT', 10.00, 'USD', 100.00, 90.00, now())
+    `, '23503');
+    await expectSqlState(`
+      insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+      values ('00000000-0000-0000-0000-000000000187', '${transaction.walletId}', '${transaction.transactionId}', 'DEBIT', 9.00, 'BRL', 100.00, 91.00, now())
+    `, '23514', 'wallet_ledger_entries_transaction_consistency');
+    await expectSqlState(`
+      insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+      values ('00000000-0000-0000-0000-000000000188', '${transaction.walletId}', '${transaction.transactionId}', 'CREDIT', 10.00, 'BRL', 100.00, 110.00, now())
+    `, '23514', 'wallet_ledger_entries_transaction_consistency');
+
+    const lossWalletId = '00000000-0000-0000-0000-000000000193';
+    const lossPlayerId = '00000000-0000-0000-0000-000000000197';
+    const lossTransactionId = '00000000-0000-0000-0000-000000000198';
+    await orm.em.getConnection().execute(`
+      insert into wallets (id, player_id, currency, balance, created_at, updated_at)
+      values ('${lossWalletId}', '${lossPlayerId}', 'BRL', 100.00, now(), now());
+      insert into wager_transactions (
+        id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+        wallet_id, player_id, round_id, game_id, kind, amount, currency, status, processed_at, created_at
+      ) values (
+        '${lossTransactionId}', 'provider-113', 'external-loss-113', 'provider-113:external-loss-113', 'payload-loss-113',
+        '${lossWalletId}', '${lossPlayerId}', 'round-113', 'game-113', 'LOSS', 0.00, 'BRL', 'PROCESSED', now(), now()
+      );
+    `);
+    await expectSqlState(`
+      insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+      values ('00000000-0000-0000-0000-000000000189', '${lossWalletId}', '${lossTransactionId}', 'CREDIT', 1.00, 'BRL', 100.00, 101.00, now())
+    `, '23514', 'wallet_ledger_entries_transaction_consistency');
+  });
+
+  test('makes every terminal transaction row immutable, including historical result snapshots', async () => {
+    const transaction = await insertWalletAndTransaction('114', 'PENDING');
+    const otherWalletId = '00000000-0000-0000-0000-000000000190';
+    await orm.em.getConnection().execute(`
+      insert into wallets (id, player_id, currency, balance, created_at, updated_at)
+      values ('${otherWalletId}', '00000000-0000-0000-0000-000000000195', 'BRL', 100.00, now(), now());
+      update wager_transactions
+      set status = 'PROCESSED', processed_at = now(), resulting_balance = 90.00
+      where id = '${transaction.transactionId}';
+    `);
+
+    await expectSqlState(`update wager_transactions set amount = 9.00 where id = '${transaction.transactionId}'`, '55000');
+    await expectSqlState(`update wager_transactions set wallet_id = '${otherWalletId}' where id = '${transaction.transactionId}'`, '55000');
+    await expectSqlState(`update wager_transactions set resulting_balance = 80.00 where id = '${transaction.transactionId}'`, '55000');
+  });
+
+  test('allows a zero-value LOSS in PostgreSQL without allowing a ledger entry', async () => {
+    const walletId = '00000000-0000-0000-0000-000000000191';
+    const playerId = '00000000-0000-0000-0000-000000000196';
+    const transactionId = '00000000-0000-0000-0000-000000000192';
+    await orm.em.getConnection().execute(`
+      insert into wallets (id, player_id, currency, balance, created_at, updated_at)
+      values ('${walletId}', '${playerId}', 'BRL', 100.00, now(), now());
+      insert into wager_transactions (
+        id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+        wallet_id, player_id, round_id, game_id, kind, amount, currency, status, processed_at, created_at
+      ) values (
+        '${transactionId}', 'provider-115', 'external-loss-115', 'provider-115:external-loss-115', 'payload-loss-115',
+        '${walletId}', '${playerId}', 'round-115', 'game-115', 'LOSS', 0.00, 'BRL', 'PROCESSED', now(), now()
+      );
+    `);
+
+    const result = await orm.em.getConnection().execute(
+      `select amount::text, kind from wager_transactions where id = '${transactionId}'`,
+    ) as Array<{ amount: string; kind: string }>;
+    expect(result).toEqual([{ amount: '0.00', kind: 'LOSS' }]);
   });
 });

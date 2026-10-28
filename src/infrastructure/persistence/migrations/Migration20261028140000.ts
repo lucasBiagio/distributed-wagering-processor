@@ -14,6 +14,7 @@ export class Migration20261028140000 extends Migration {
         constraint wallets_currency_format check (currency ~ '^[A-Z]{3}$'),
         constraint wallets_timestamp_order check (updated_at >= created_at),
         constraint wallets_player_currency_unique unique (player_id, currency),
+        constraint wallets_identity_currency_unique unique (id, currency),
         constraint wallets_identity_player_currency_unique unique (id, player_id, currency)
       );
 
@@ -28,17 +29,23 @@ export class Migration20261028140000 extends Migration {
         round_id text not null,
         game_id text not null,
         kind text not null,
-        amount numeric(20,2) not null check (amount > 0),
+        amount numeric(20,2) not null,
         currency char(3) not null,
         reference_transaction_id uuid null references wager_transactions(id) on delete restrict,
         reference_external_transaction_id text null,
         status text not null,
         failure_code text null,
         processed_at timestamptz null,
+        resulting_balance numeric(20,2) null check (resulting_balance >= 0),
         created_at timestamptz not null,
         constraint wager_transactions_wallet_identity_fk foreign key (wallet_id, player_id, currency)
           references wallets (id, player_id, currency) on delete restrict,
+        constraint wager_transactions_identity_wallet_currency_unique unique (id, wallet_id, currency),
         constraint wager_transactions_currency_format check (currency ~ '^[A-Z]{3}$'),
+        constraint wager_transactions_amount_by_kind check (
+          (kind = 'LOSS' and amount >= 0)
+          or (kind <> 'LOSS' and amount > 0)
+        ),
         constraint wager_transactions_kind check (kind in ('OPENING', 'BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK')),
         constraint wager_transactions_status check (status in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')),
         constraint wager_transactions_reference_requirement check (
@@ -52,6 +59,15 @@ export class Migration20261028140000 extends Migration {
         constraint wager_transactions_processed_at check (
           (status = 'PROCESSED' and processed_at is not null)
           or (status <> 'PROCESSED' and processed_at is null)
+        ),
+        constraint wager_transactions_processed_reversal_reference_required check (
+          status <> 'PROCESSED'
+          or kind not in ('REFUND', 'ROLLBACK')
+          or reference_transaction_id is not null
+        ),
+        constraint wager_transactions_pending_result_snapshot check (
+          status not in ('PENDING', 'PENDING_REFERENCE')
+          or resulting_balance is null
         )
       );
 
@@ -65,20 +81,24 @@ export class Migration20261028140000 extends Migration {
         where reference_external_transaction_id is not null;
       create index wager_transactions_wallet_status_lookup
         on wager_transactions (wallet_id, status, created_at);
-      create unique index wager_transactions_processed_reversal_unique
-        on wager_transactions (reference_transaction_id, kind)
+      create unique index wager_transactions_processed_economic_reversal_unique
+        on wager_transactions (reference_transaction_id)
         where status = 'PROCESSED' and kind in ('REFUND', 'ROLLBACK') and reference_transaction_id is not null;
 
       create table wallet_ledger_entries (
         id uuid primary key,
-        wallet_id uuid not null references wallets(id) on delete restrict,
-        transaction_id uuid not null references wager_transactions(id) on delete restrict,
+        wallet_id uuid not null,
+        transaction_id uuid not null,
         direction text not null check (direction in ('DEBIT', 'CREDIT')),
         amount numeric(20,2) not null check (amount > 0),
         currency char(3) not null,
         balance_before numeric(20,2) not null check (balance_before >= 0),
         balance_after numeric(20,2) not null check (balance_after >= 0),
         created_at timestamptz not null,
+        constraint wallet_ledger_entries_wallet_currency_fk foreign key (wallet_id, currency)
+          references wallets (id, currency) on delete restrict,
+        constraint wallet_ledger_entries_transaction_identity_fk foreign key (transaction_id, wallet_id, currency)
+          references wager_transactions (id, wallet_id, currency) on delete restrict,
         constraint wallet_ledger_entries_currency_format check (currency ~ '^[A-Z]{3}$'),
         constraint wallet_ledger_entries_wallet_transaction_unique unique (wallet_id, transaction_id),
         constraint wallet_ledger_entries_arithmetic check (
@@ -142,38 +162,80 @@ export class Migration20261028140000 extends Migration {
         before delete on wallet_ledger_entries
         for each row execute function prevent_wallet_ledger_entry_mutation();
 
-      create function require_processed_transaction_for_wallet_ledger_entry() returns trigger language plpgsql as $$
+      create function require_consistent_transaction_for_wallet_ledger_entry() returns trigger language plpgsql as $$
       declare
+        transaction_kind text;
         transaction_status text;
+        transaction_amount numeric(20,2);
+        reference_kind text;
+        expected_direction text;
       begin
-        select status into transaction_status
-        from wager_transactions
-        where id = new.transaction_id;
+        select kind, status, amount
+          into transaction_kind, transaction_status, transaction_amount
+          from wager_transactions
+          where id = new.transaction_id
+            and wallet_id = new.wallet_id
+            and currency = new.currency;
+
+        if transaction_status is null then
+          return new;
+        end if;
 
         if transaction_status is distinct from 'PROCESSED' then
-          raise exception 'wallet ledger entries require a processed wager transaction' using errcode = '23514';
+          raise exception 'wallet ledger entries require a processed wager transaction'
+            using errcode = '23514', constraint = 'wallet_ledger_entries_transaction_consistency';
+        end if;
+
+        if transaction_kind in ('LOSS') then
+          raise exception 'LOSS wager transactions cannot produce ledger entries'
+            using errcode = '23514', constraint = 'wallet_ledger_entries_transaction_consistency';
+        end if;
+
+        if new.amount is distinct from transaction_amount then
+          raise exception 'wallet ledger amount must equal wager transaction amount'
+            using errcode = '23514', constraint = 'wallet_ledger_entries_transaction_consistency';
+        end if;
+
+        if transaction_kind = 'ROLLBACK' then
+          select kind into reference_kind
+            from wager_transactions
+            where id = (
+              select reference_transaction_id from wager_transactions where id = new.transaction_id
+            );
+          expected_direction := case when reference_kind = 'BET' then 'CREDIT' else 'DEBIT' end;
+        else
+          expected_direction := case
+            when transaction_kind = 'BET' then 'DEBIT'
+            when transaction_kind in ('OPENING', 'WIN', 'REFUND') then 'CREDIT'
+            else null
+          end;
+        end if;
+
+        if new.direction is distinct from expected_direction then
+          raise exception 'wallet ledger direction must match wager transaction effect'
+            using errcode = '23514', constraint = 'wallet_ledger_entries_transaction_consistency';
         end if;
 
         return new;
       end;
       $$;
 
-      create trigger wallet_ledger_entries_processed_transaction_guard
+      create trigger wallet_ledger_entries_transaction_consistency_guard
         before insert on wallet_ledger_entries
-        for each row execute function require_processed_transaction_for_wallet_ledger_entry();
+        for each row execute function require_consistent_transaction_for_wallet_ledger_entry();
 
-      create function prevent_terminal_wager_transaction_transition() returns trigger language plpgsql as $$
+      create function prevent_terminal_wager_transaction_mutation() returns trigger language plpgsql as $$
       begin
-        if old.status in ('PROCESSED', 'REJECTED', 'FAILED') and new.status is distinct from old.status then
-          raise exception 'terminal wager transaction status cannot transition' using errcode = '55000';
+        if old.status in ('PROCESSED', 'REJECTED', 'FAILED') then
+          raise exception 'terminal wager transactions are immutable' using errcode = '55000';
         end if;
         return new;
       end;
       $$;
 
-      create trigger wager_transactions_terminal_status_guard
+      create trigger wager_transactions_terminal_immutability_guard
         before update on wager_transactions
-        for each row execute function prevent_terminal_wager_transaction_transition();
+        for each row execute function prevent_terminal_wager_transaction_mutation();
     `);
   }
 
@@ -181,10 +243,10 @@ export class Migration20261028140000 extends Migration {
     this.addSql(`
       drop trigger if exists wallets_version_balance_guard on wallets;
       drop function if exists enforce_wallet_version_on_balance_change();
-      drop trigger if exists wager_transactions_terminal_status_guard on wager_transactions;
-      drop function if exists prevent_terminal_wager_transaction_transition();
-      drop trigger if exists wallet_ledger_entries_processed_transaction_guard on wallet_ledger_entries;
-      drop function if exists require_processed_transaction_for_wallet_ledger_entry();
+      drop trigger if exists wager_transactions_terminal_immutability_guard on wager_transactions;
+      drop function if exists prevent_terminal_wager_transaction_mutation();
+      drop trigger if exists wallet_ledger_entries_transaction_consistency_guard on wallet_ledger_entries;
+      drop function if exists require_consistent_transaction_for_wallet_ledger_entry();
       drop trigger if exists wallet_ledger_entries_no_delete on wallet_ledger_entries;
       drop trigger if exists wallet_ledger_entries_no_update on wallet_ledger_entries;
       drop function if exists prevent_wallet_ledger_entry_mutation();
