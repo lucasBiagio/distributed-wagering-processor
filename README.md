@@ -95,3 +95,59 @@ docker compose down -v
 ```
 
 This is destructive for the Compose development volume. It is not required for CP2A integration tests.
+
+## CP2B-1 financial processing
+
+CP2B-1 adds HTTP endpoints for wallet opening and **BET only**:
+
+- `POST /wallets` and `GET /wallets/:walletId`;
+- `POST /wagering/transactions` with required `Idempotency-Key`;
+- `GET /wagering/transactions/:transactionId`; and
+- `GET /providers/:providerId/wagering/transactions/:externalTransactionId`.
+
+`WIN`, `LOSS`, `REFUND`, `ROLLBACK`, and `PENDING_REFERENCE` are not exposed by this checkpoint. Unsupported kinds are rejected instead of acknowledged.
+
+Wallet opening, BET processing, ledger persistence, terminal snapshots, and outbox persistence occur inside one MikroORM SQL transaction. BET acquires a pessimistic write lock on its wallet (`SELECT ... FOR UPDATE`), then persists the wallet balance/version, terminal transaction, optional ledger row, and typed outbox rows before commit. An insufficient-balance BET is committed as `REJECTED` with `INSUFFICIENT_BALANCE`, its observed `resulting_balance`, no balance/version update, no debit ledger, and a rejection event.
+
+The durable idempotency identity is PostgreSQL. The canonical SHA-256 payload includes `providerId`, `externalTransactionId`, `walletId`, `playerId`, `roundId`, `gameId`, `kind`, and `{ amount, currency }`, recursively sorted by JSON object key. It excludes `Idempotency-Key`, correlation IDs, and transport metadata. A matching key/hash returns the original persisted response with `idempotentReplay: true`; the historical `resulting_balance` is not recalculated after subsequent movements. A changed payload for the same key and a duplicate `(providerId, externalTransactionId)` are conflicts.
+
+CP2B-1 records typed, versioned integration events atomically in the outbox (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged`) but does not publish SQS messages. Publisher, retry, and DLQ work remain CP3.
+
+The terminal transaction delete trigger was added to the existing CP2A migration because the migration is not integrated into `main` and has no production deployment. It blocks application-role deletion of `PROCESSED`, `REJECTED`, and `FAILED` rows—including rows without a ledger—while migration down remains reversible in isolated databases.
+
+Run the CP2B-1 PostgreSQL suites only against a disposable database:
+
+```bash
+bun test test/integration/financial-processing.spec.ts   # BET, concurrency, replay, 3 processes
+bun test test/integration/financial-atomicity.spec.ts    # rollback by fault injection, transient failures
+bun test test/integration/financial-lock-sql.spec.ts     # captured SELECT ... FOR UPDATE evidence
+bun test test/integration/financial-http.spec.ts         # real NestJS server over HTTP
+bun run test                                             # unit + integration, 60s hook timeout
+```
+
+It covers zero/positive opening, ledger creation, durable rejection, delete protection, idempotent replay, 50 concurrent identical calls, same-wallet balance contention, independent wallets, historical replay snapshots, duplicate provider transactions, and three separate Bun worker processes sharing one PostgreSQL database.
+
+### CP2B-1-R1 closure
+
+Transient PostgreSQL conflicts (`40001` serialization failure, `40P01` deadlock) retry the complete transaction at most three times (`MAX_BET_ATTEMPTS`). This is safe because no effect leaves the database before commit: outbox rows are persisted, never published. Unique violations (`23505`) are resolved as idempotent replays or conflicts, and every other failure propagates unchanged — a transient infrastructure error is never converted into a financial `REJECTED`.
+
+Rollback is proven with a deterministic test-only interception point, `MikroOrmFinancialProcessing.interceptUnitOfWork`, a protected no-op in production that integration tests override by subclassing. No header, body field, or environment variable can trigger a failure through the API.
+
+HTTP contract observed end to end against a real server:
+
+| Case | Status | Body |
+| --- | --- | --- |
+| wallet created | 201 | wallet view |
+| BET processed | 200 | `PROCESSED`, new balance |
+| BET replayed | 200 | same `transactionId`, `idempotentReplay: true` |
+| same key, other payload | 409 | `IDEMPOTENCY_CONFLICT` |
+| insufficient balance | 200 | durable `REJECTED` + `INSUFFICIENT_BALANCE` |
+| missing `Idempotency-Key` | 400 | `IDEMPOTENCY_KEY_REQUIRED` |
+| numeric monetary amount | 400 | `INVALID_PAYLOAD` |
+| unknown wallet / transaction | 404 | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` |
+| currency the wallet does not hold | 400 | `CURRENCY_MISMATCH` |
+| kind outside CP2B-1 | 400 | `INVALID_TRANSACTION` |
+
+An insufficient-balance BET is a committed financial outcome, not a transport error, so it answers 200 with the terminal record instead of 422.
+
+The HTTP suite starts the production entrypoint `src/main.ts` in a separate process, because `NestFactory.create` cannot be hosted inside the `bun test` runner. Readiness degradation is verified by starting a second server process against an unreachable SQS endpoint, never by stopping shared infrastructure.

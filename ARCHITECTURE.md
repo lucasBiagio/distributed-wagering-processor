@@ -73,3 +73,25 @@ MikroORM connects PostgreSQL; SQS uses AWS SDK v3 against LocalStack locally. Li
 ## Verification boundary
 
 The CP2A integration suite runs on an isolated PostgreSQL database. It proves migration `UP/DOWN/UP`, all five tables, SQLSTATE failures for required uniqueness/check/FK/trigger paths, legal transaction transitions, ordered ledger creation, reversal uniqueness, OPENING representation, wallet-version behavior, and MikroORM numeric precision after clear/reload. It does not prove CP2B worker, HTTP, recovery, or race behavior.
+
+## CP2B-1 implementation
+
+CP2B-1 introduces `OpenWalletUseCase` and `ProcessWagerUseCase` over a financial-processing application port. The MikroORM implementation owns transaction boundaries and domain/persistence mapping; Nest controllers only validate transport contracts and map errors. The domain still imports neither NestJS nor MikroORM.
+
+For a BET, the adapter validates the monetary string and identity fields, canonicalizes the business payload, and calculates SHA-256 over the recursively key-sorted JSON containing `providerId`, `externalTransactionId`, `walletId`, `playerId`, `roundId`, `gameId`, `kind`, and `money`. It intentionally excludes idempotency/correlation/transport fields. A SQL transaction then checks persisted idempotency, locks the wallet with MikroORM `PESSIMISTIC_WRITE` (`SELECT ... FOR UPDATE`), checks idempotency again under the lock, rehydrates the aggregate, and commits the wallet transition, terminal transaction, exact `resulting_balance`, optional ledger entry, and outbox records together.
+
+The wallet is the containment unit: there is no global lock or in-memory idempotency structure. PostgreSQL unique constraints remain the final cross-process protection for the idempotency key and provider/external transaction identity. A matching stored hash returns the historical transaction/snapshot; a changed hash is a conflict. Insufficient balance is a committed `REJECTED` transaction with `INSUFFICIENT_BALANCE`, unchanged wallet/version, no ledger, and a rejection outbox record—not an exception that rolls back the audit record.
+
+Positive wallet opening persists an internal `OPENING`/`CREDIT` pair in the same transaction; zero opening creates neither. `WalletBalanceChanged` is persisted only for a balance movement. CP2B-1 persists typed event envelopes but does not publish SQS messages; publication and retry are CP3.
+
+The CP2A migration now additionally rejects `DELETE` of terminal wager rows. This was amended before integration to `main` or production deployment. It protects rejected rows with no ledger as well as processed rows. Reversibility remains supported by dropping the trigger/function in migration down; disposable test cleanup uses migration/schema teardown rather than deleting terminal history.
+
+## CP2B-1-R1 closure decisions
+
+`MikroOrmFinancialProcessing` receives the global MikroORM provider by plain constructor injection. `@InjectMikroORM('default')` was wrong: `MikroOrmModule.forRoot` without a context name never registers a `default_MikroORM` token, so the Nest container could not build `FinancialHttpModule` at runtime. Type checking and compilation cannot detect this class of defect, so a real server boot is now part of the gate set.
+
+Failure atomicity is observable without weakening production code. `interceptUnitOfWork(stage, em)` is a protected no-op with two stages inside the BET unit of work — after the wallet/transaction flush and after the ledger/outbox flush, both still before commit. Only a subclass can replace it, which the integration suite does; no runtime input reaches it.
+
+Transient conflict handling is explicit. `40001` and `40P01` are retried up to `MAX_BET_ATTEMPTS = 3` for the whole transaction, never for a partial unit of work and never for definitive business or uniqueness violations. Retrying is safe only because the outbox is a database table: nothing is published before commit, so a retried attempt cannot emit a duplicate external effect. When the limit is exhausted the original SQLSTATE propagates as an infrastructure failure and the wallet is left exactly as it was — a transient fault must never be recorded as a financial `REJECTED`.
+
+Lookup endpoints treat a malformed identifier as "not found" instead of letting PostgreSQL raise `22P02` as a 500. Currency incompatibility between the wallet and the requested money is a `CURRENCY_MISMATCH` domain rule error, and `Money` validation failures map to `INVALID_MONEY`, so no monetary input can surface as an unhandled server error.

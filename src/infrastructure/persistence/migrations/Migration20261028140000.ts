@@ -236,6 +236,19 @@ export class Migration20261028140000 extends Migration {
       create trigger wager_transactions_terminal_immutability_guard
         before update on wager_transactions
         for each row execute function prevent_terminal_wager_transaction_mutation();
+
+      create function prevent_terminal_wager_transaction_delete() returns trigger language plpgsql as $$
+      begin
+        if old.status in ('PROCESSED', 'REJECTED', 'FAILED') then
+          raise exception 'terminal wager transactions cannot be deleted' using errcode = '55000';
+        end if;
+        return old;
+      end;
+      $$;
+
+      create trigger wager_transactions_terminal_delete_guard
+        before delete on wager_transactions
+        for each row execute function prevent_terminal_wager_transaction_delete();
     `);
   }
 
@@ -243,6 +256,8 @@ export class Migration20261028140000 extends Migration {
     this.addSql(`
       drop trigger if exists wallets_version_balance_guard on wallets;
       drop function if exists enforce_wallet_version_on_balance_change();
+      drop trigger if exists wager_transactions_terminal_delete_guard on wager_transactions;
+      drop function if exists prevent_terminal_wager_transaction_delete();
       drop trigger if exists wager_transactions_terminal_immutability_guard on wager_transactions;
       drop function if exists prevent_terminal_wager_transaction_mutation();
       drop trigger if exists wallet_ledger_entries_transaction_consistency_guard on wallet_ledger_entries;

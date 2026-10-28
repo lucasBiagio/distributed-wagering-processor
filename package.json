@@ -11,8 +11,8 @@
     "start:dev": "bun --watch src/main.ts",
     "typecheck": "tsc --noEmit",
     "build": "nest build",
-    "test": "bun test test",
-    "test:watch": "bun test test --watch",
+    "test": "bun test test --timeout 60000",
+    "test:watch": "bun test test --timeout 60000 --watch",
     "migration:up": "mikro-orm migration:up --config mikro-orm.config.ts",
     "migration:down": "mikro-orm migration:down --config mikro-orm.config.ts"
   },
