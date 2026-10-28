@@ -76,7 +76,7 @@ describe('CP2B-1-R3 FIX-02 outbox envelope contract', () => {
   });
 
   afterAll(async () => {
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
     await orm.close(true);
   });
 

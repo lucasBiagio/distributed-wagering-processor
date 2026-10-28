@@ -111,7 +111,7 @@ describe('CP2B-1-R1 financial atomicity and transient failure handling', () => {
   });
 
   afterAll(async () => {
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
     await orm.close(true);
   });
 

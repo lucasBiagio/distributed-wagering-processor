@@ -29,6 +29,8 @@ export class WagerTransactionRecord {
   public failureCode!: string | null;
   public processedAt!: Date | null;
   public resultingBalance!: string | null;
+  public referenceAttempts!: number;
+  public referenceNextAttemptAt!: Date | null;
   public createdAt!: Date;
 }
 
@@ -99,6 +101,8 @@ export const WagerTransactionRecordSchema = new EntitySchema<WagerTransactionRec
     failureCode: { type: String, fieldName: 'failure_code', nullable: true },
     processedAt: { type: Date, fieldName: 'processed_at', nullable: true },
     resultingBalance: { type: new DecimalType('string'), fieldName: 'resulting_balance', precision: 20, scale: 2, nullable: true },
+    referenceAttempts: { type: 'integer', fieldName: 'reference_attempts', default: 0 },
+    referenceNextAttemptAt: { type: Date, fieldName: 'reference_next_attempt_at', nullable: true },
     createdAt: { type: Date, fieldName: 'created_at' },
   },
 });

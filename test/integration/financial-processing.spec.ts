@@ -52,7 +52,7 @@ describe('CP2B-1 financial processing', () => {
   });
 
   afterAll(async () => {
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
     await orm.close(true);
   });
 

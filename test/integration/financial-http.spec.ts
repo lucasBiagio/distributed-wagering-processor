@@ -113,7 +113,7 @@ describe('CP2B-1-R1 HTTP end to end', () => {
   afterAll(async () => {
     server.kill();
     await server.exited;
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
     await orm.close(true);
   });
 
@@ -308,8 +308,9 @@ describe('CP2B-1-R1 HTTP end to end', () => {
     expect(walletState.body).toMatchObject({ balance: { amount: '75.00', currency: 'BRL' }, version: 2 });
   });
 
-  test('TEST-02 case 10: kinds outside the CP2B-1 scope are refused instead of faked', async () => {
-    const unsupported = await Promise.all(['OPENING', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK'].map((kind, index) => call(
+  test('TEST-02 case 10: CP2B-2 accepts WIN and LOSS while rejecting unsupported or unreferenced operations', async () => {
+    const kinds = ['OPENING', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK'];
+    const responses = await Promise.all(kinds.map((kind, index) => call(
       'POST',
       '/wagering/transactions',
       {
@@ -322,21 +323,77 @@ describe('CP2B-1-R1 HTTP end to end', () => {
       },
     )));
     const walletState = await call('GET', `/wallets/${wallet.id}`);
-    const stored = await Promise.all(['OPENING', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK'].map(
+    const stored = await Promise.all(kinds.map(
       (_kind, index) => call('GET', `/providers/provider-http/wagering/transactions/external-http-kind-${index}`),
     ));
 
-    for (const response of unsupported) {
+    const [opening, win, loss, refund, rollback] = responses as [
+      HttpResult,
+      HttpResult,
+      HttpResult,
+      HttpResult,
+      HttpResult,
+    ];
+    const [storedOpening, storedWin, storedLoss, storedRefund, storedRollback] = stored as [
+      HttpResult,
+      HttpResult,
+      HttpResult,
+      HttpResult,
+      HttpResult,
+    ];
+
+    expect(opening.status).toBe(400);
+    expect(opening.body).toMatchObject({ failureCode: 'INVALID_TRANSACTION' });
+    expect(win.status).toBe(200);
+    expect(win.body).toMatchObject({ kind: 'WIN', status: 'PROCESSED' });
+    expect(loss.status).toBe(200);
+    expect(loss.body).toMatchObject({ kind: 'LOSS', status: 'PROCESSED' });
+    for (const response of [refund, rollback]) {
       expect(response.status).toBe(400);
       expect(response.body).toMatchObject({ failureCode: 'INVALID_TRANSACTION' });
     }
-    for (const response of stored) {
-      expect(response.status).toBe(404);
-    }
-    expect(walletState.body).toMatchObject({ balance: { amount: '75.00', currency: 'BRL' }, version: 2 });
+    expect(storedOpening.status).toBe(404);
+    expect(storedWin.status).toBe(200);
+    expect(storedLoss.status).toBe(200);
+    expect(storedRefund.status).toBe(404);
+    expect(storedRollback.status).toBe(404);
+    expect(walletState.body).toMatchObject({ balance: { amount: '100.00', currency: 'BRL' }, version: 3 });
   });
 
-  test('TEST-02 case 11 (FIX-01): POST /wallets accepts the exact UUIDv7 playerId from CHALLENGE.md', async () => {
+  test('TEST-02 case 11: HTTP routes persist a referenced REFUND as one reversal', async () => {
+    const bet = await call('POST', '/wagering/transactions', {
+      idempotencyKey: 'http-referenced-refund-bet',
+      body: betBody({
+        externalTransactionId: 'external-http-referenced-refund-bet',
+        roundId: 'round-http-referenced-refund',
+        money: { amount: '10.00', currency: 'BRL' },
+      }),
+    });
+    const refund = await call('POST', '/wagering/transactions', {
+      idempotencyKey: 'http-referenced-refund',
+      body: betBody({
+        kind: 'REFUND',
+        externalTransactionId: 'external-http-referenced-refund',
+        roundId: 'round-http-referenced-refund',
+        money: { amount: '10.00', currency: 'BRL' },
+        referenceExternalTransactionId: 'external-http-referenced-refund-bet',
+      }),
+    });
+    const walletState = await call('GET', `/wallets/${wallet.id}`);
+
+    expect(bet.status).toBe(200);
+    expect(bet.body).toMatchObject({ kind: 'BET', status: 'PROCESSED', balance: { amount: '90.00', currency: 'BRL' } });
+    expect(refund.status).toBe(200);
+    expect(refund.body).toMatchObject({
+      kind: 'REFUND',
+      status: 'PROCESSED',
+      referenceTransactionId: bet.body.transactionId,
+      balance: { amount: '100.00', currency: 'BRL' },
+    });
+    expect(walletState.body).toMatchObject({ balance: { amount: '100.00', currency: 'BRL' }, version: 5 });
+  });
+
+  test('TEST-02 case 12 (FIX-01): POST /wallets accepts the exact UUIDv7 playerId from CHALLENGE.md', async () => {
     const created = await call('POST', '/wallets', {
       body: { playerId: CHALLENGE_PLAYER_ID, initialBalance: { amount: '100.00', currency: 'BRL' } },
     });

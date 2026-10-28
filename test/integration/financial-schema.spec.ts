@@ -64,6 +64,7 @@ async function insertWalletAndTransaction(
   const playerId = `00000000-0000-0000-0000-000000000${Number(seed) + 10}`;
   const transactionId = `00000000-0000-0000-0000-000000000${Number(seed) + 20}`;
   const processedAt = status === 'PROCESSED' ? 'now()' : 'null';
+  const referenceNextAttemptAt = status === 'PENDING_REFERENCE' ? 'now()' : 'null';
   const connection = orm.em.getConnection();
 
   await connection.execute(`
@@ -73,11 +74,11 @@ async function insertWalletAndTransaction(
     insert into wager_transactions (
       id, provider_id, external_transaction_id, idempotency_key, payload_hash,
       wallet_id, player_id, round_id, game_id, kind, amount, currency,
-      status, processed_at, created_at
+      status, processed_at, reference_next_attempt_at, created_at
     ) values (
       '${transactionId}', 'provider-${seed}', 'external-bet-${seed}', 'provider-${seed}:external-bet-${seed}', 'payload-hash-${seed}',
       '${walletId}', '${playerId}', 'round-${seed}', 'game-${seed}', 'BET', 10.00, 'BRL',
-      '${status}', ${processedAt}, now()
+      '${status}', ${processedAt}, ${referenceNextAttemptAt}, now()
     );
   `);
 
@@ -91,7 +92,7 @@ describe('financial schema migration', () => {
   });
 
   afterAll(async () => {
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
 
     const result = await orm.em.getConnection().execute(
       "select to_regclass('public.wallets') as wallets, to_regclass('public.wager_transactions') as wager_transactions, to_regclass('public.wallet_ledger_entries') as wallet_ledger_entries, to_regclass('public.inbox_messages') as inbox_messages, to_regclass('public.outbox_messages') as outbox_messages",
@@ -123,7 +124,7 @@ describe('financial schema migration', () => {
   });
 
   test('supports a reversible migration UP/DOWN/UP cycle', async () => {
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
 
     const afterDown = await orm.em.getConnection().execute(
       "select to_regclass('public.wallets') as wallets, to_regclass('public.wager_transactions') as wager_transactions, to_regclass('public.wallet_ledger_entries') as wallet_ledger_entries, to_regclass('public.inbox_messages') as inbox_messages, to_regclass('public.outbox_messages') as outbox_messages",
@@ -399,17 +400,32 @@ describe('financial schema migration', () => {
     );
   });
 
+  test('requires retry scheduling metadata only while a reference is pending', async () => {
+    const pending = await insertWalletAndTransaction('117', 'PENDING');
+
+    await expectSqlState(
+      `update wager_transactions set status = 'PENDING_REFERENCE' where id = '${pending.transactionId}'`,
+      '23514',
+      'wager_transactions_reference_schedule_pending_only',
+    );
+    await expectSqlState(
+      `update wager_transactions set reference_next_attempt_at = now() where id = '${pending.transactionId}'`,
+      '23514',
+      'wager_transactions_reference_schedule_pending_only',
+    );
+  });
+
   test('allows valid PENDING and PENDING_REFERENCE transitions to PROCESSED', async () => {
     const pending = await insertWalletAndTransaction('108', 'PENDING');
     const pendingReference = await insertWalletAndTransaction('109', 'PENDING_REFERENCE');
 
     await orm.em.getConnection().execute(`
       update wager_transactions
-      set status = 'PENDING_REFERENCE'
+      set status = 'PENDING_REFERENCE', reference_next_attempt_at = now()
       where id = '${pending.transactionId}';
 
       update wager_transactions
-      set status = 'PROCESSED', processed_at = now()
+      set status = 'PROCESSED', processed_at = now(), reference_next_attempt_at = null
       where id in ('${pending.transactionId}', '${pendingReference.transactionId}');
     `);
 

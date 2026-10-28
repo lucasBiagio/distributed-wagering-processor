@@ -136,6 +136,52 @@ export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionR
   }
 }
 
+export interface WagerTransactionPendingReferenceData {
+  readonly transactionId: string;
+  readonly walletId: string;
+  readonly referenceExternalTransactionId: string;
+  readonly attempts: number;
+  readonly nextAttemptAt: string;
+}
+
+/**
+ * CP2B-2: emitted once, when a reversal arrives before the transaction it reverses. It
+ * declares the awaited reference and when the resolution sweep will look again, so a
+ * consumer can reconcile without polling the database. Retries do not re-emit it.
+ */
+export class WagerTransactionPendingReference extends IntegrationEvent<WagerTransactionPendingReferenceData> {
+  public readonly eventType = 'WagerTransactionPendingReference';
+  public readonly version = 1;
+
+  public constructor(props: IntegrationEventProps<WagerTransactionPendingReferenceData>) {
+    super(props);
+  }
+
+  public static from(
+    transactionId: string,
+    walletId: string,
+    referenceExternalTransactionId: string,
+    attempts: number,
+    nextAttemptAt: Date,
+    ctx: EventContext,
+  ): WagerTransactionPendingReference {
+    return new WagerTransactionPendingReference({
+      eventId: ctx.eventId,
+      aggregateId: transactionId,
+      correlationId: ctx.correlationId,
+      ...(ctx.causationId === undefined ? {} : { causationId: ctx.causationId }),
+      occurredAt: ctx.occurredAt,
+      data: {
+        transactionId,
+        walletId,
+        referenceExternalTransactionId,
+        attempts,
+        nextAttemptAt: nextAttemptAt.toISOString(),
+      },
+    });
+  }
+}
+
 export interface WalletBalanceChangedData {
   readonly walletId: string;
   readonly transactionId: string;

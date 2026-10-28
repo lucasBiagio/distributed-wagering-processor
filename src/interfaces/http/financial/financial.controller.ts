@@ -83,6 +83,9 @@ export class FinancialController {
         gameId: string(payload.gameId, 'gameId'),
         kind: string(payload.kind, 'kind') as 'BET',
         money: money(payload.money),
+        ...(payload.referenceExternalTransactionId === undefined
+          ? {}
+          : { referenceExternalTransactionId: string(payload.referenceExternalTransactionId, 'referenceExternalTransactionId') }),
       } satisfies ProcessBetCommand);
     } catch (error) {
       this.rethrow(error);
