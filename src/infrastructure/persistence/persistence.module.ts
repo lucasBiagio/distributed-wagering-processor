@@ -3,13 +3,14 @@ import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { PostgreSqlDriver } from '@mikro-orm/postgresql';
 
 import { getAppConfig } from '../config.js';
+import { financialEntities } from './financial-entities.js';
 
 @Module({
   imports: [
     MikroOrmModule.forRoot({
       driver: PostgreSqlDriver,
       clientUrl: getAppConfig().databaseUrl,
-      entities: [],
+      entities: financialEntities,
       discovery: {
         warnWhenNoEntities: false,
       },
