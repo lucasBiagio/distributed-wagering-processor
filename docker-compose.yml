@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:17.2-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-wagering}
+      POSTGRES_USER: ${POSTGRES_USER:-wagering}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wagering}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      DEBUG: 0
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      - ./scripts/localstack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs list-queues --region $$AWS_DEFAULT_REGION >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wagering}:${POSTGRES_PASSWORD:-wagering}@postgres:5432/${POSTGRES_DB:-wagering}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SQS_ENDPOINT: http://localstack:4566
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const response = await fetch('http://localhost:3000/health/live'); process.exit(response.ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
