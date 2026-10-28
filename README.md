@@ -151,3 +151,17 @@ HTTP contract observed end to end against a real server:
 An insufficient-balance BET is a committed financial outcome, not a transport error, so it answers 200 with the terminal record instead of 422.
 
 The HTTP suite starts the production entrypoint `src/main.ts` in a separate process, because `NestFactory.create` cannot be hosted inside the `bun test` runner. Readiness degradation is verified by starting a second server process against an unreachable SQS endpoint, never by stopping shared infrastructure.
+
+### CP2B-1-R3 closure
+
+Identifier validation accepts every RFC 9562 UUID version (1-8) with a valid variant, not only UUIDv4. CHALLENGE.md identifies players with UUIDv7 (`0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1`), which the previous `[1-5]` version range rejected with 400 on `POST /wallets`. Structure, version nibble, and variant bits are still enforced, so arbitrary strings, the nil UUID, version 0/9, wrong variants, wrong lengths, non-hexadecimal characters, and values with an appended SQL fragment remain rejected.
+
+The outbox payload is the serialized envelope of CHALLENGE.md section 11: `eventId`, `eventType`, `aggregateId`, `correlationId`, optional `causationId`, ISO-8601 `occurredAt`, `version`, and the typed `data`. `eventType` and `version` live in the event subclass instead of a string at the call site, and events are built by the static factories `WagerTransactionProcessed.from`, `WagerTransactionRejected.from`, and `WalletBalanceChanged.from(wallet, entry, ctx)`. `causationId` is omitted from the JSON when absent rather than serialized as `null`.
+
+The row and the envelope cannot diverge: `persistOutbox` derives `outbox_messages.id` from `eventId`, `aggregate_id` from `aggregateId`, and `event_type` from `eventType` of the event itself. The aggregate is the transaction for `WagerTransactionProcessed`/`WagerTransactionRejected` and the wallet for `WalletBalanceChanged`. When the caller supplies no `correlationId`, it defaults to that aggregate identifier.
+
+`WalletBalanceChanged.data` carries `walletId`, `transactionId`, `direction`, `money`, `balanceBefore`, `balanceAfter`, and `walletVersion`, all monetary fields as `MoneyProps` decimal strings. `walletVersion` is read from the aggregate after the movement, so it equals the version persisted by the same unit of work: 1 for a positive opening and 2 after the first BET.
+
+R3 gates: `bun run typecheck` and `bun run build` clean, and `bun run test` at 74 passing tests / 352 assertions across 14 files, including two new suites — `test/integration/financial-uuid.spec.ts` (UUID acceptance/rejection plus a UUIDv7 player persisted through opening and BET) and `test/integration/financial-outbox-envelope.spec.ts` (envelope keys, row/envelope agreement, rejection without `WalletBalanceChanged`, and no duplicate envelopes on idempotent replay).
+
+Known limitations unchanged by R3: there is no SQS publisher, so `published_at` stays `null` and publication, retry, and DLQ remain CP3; the HTTP layer does not yet read correlation/causation headers, so over REST both fields fall back to the aggregate identifier and `causationId` is only reachable through the application port; and `WagerTransactionProcessed`/`WagerTransactionRejected` keep their previous `data` shape, which CHALLENGE.md does not specify.

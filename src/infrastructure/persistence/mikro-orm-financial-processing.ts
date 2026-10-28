@@ -14,6 +14,7 @@ import {
   type WalletView,
 } from '../../application/financial-contracts.js';
 import {
+  type EventContext,
   IntegrationEvent,
   WalletBalanceChanged,
   WagerTransactionProcessed,
@@ -107,8 +108,13 @@ function transientConflict(error: unknown): boolean {
   return state !== undefined && TRANSIENT_SQLSTATES.has(state);
 }
 
+/**
+ * RFC 9562 identifiers: CHALLENGE.md uses UUIDv7 (`0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1`),
+ * while internally generated identifiers are UUIDv4. Structure, version (1-8) and the
+ * RFC variant bits are all enforced, so arbitrary strings remain rejected.
+ */
 function isUuid(value: string): boolean {
-  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function asMoney(amount: string, currency: string): MoneyProps {
@@ -220,19 +226,17 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
           balanceAfter: wallet.openingLedgerEntry.balanceAfter.toJSON().amount,
           createdAt: now,
         }));
-        this.persistOutbox(em, new WagerTransactionProcessed(
-          randomUUID(), command.correlationId ?? wallet.id, now,
-          { transactionId: opening.id, walletId: wallet.id, balance: wallet.balance.toJSON() },
-        ), opening.id);
-        this.persistOutbox(em, new WalletBalanceChanged(
-          randomUUID(), command.correlationId ?? wallet.id, now,
-          {
-            walletId: wallet.id,
-            previousBalance: Money.zero(wallet.currency).toJSON(),
-            balance: wallet.balance.toJSON(),
-            transactionId: opening.id,
-          },
-        ), wallet.id);
+        this.persistOutbox(em, WagerTransactionProcessed.from(
+          opening.id,
+          wallet.id,
+          wallet.balance.toJSON(),
+          this.eventContext(command, wallet.id, now),
+        ));
+        this.persistOutbox(em, WalletBalanceChanged.from(
+          wallet,
+          wallet.openingLedgerEntry,
+          this.eventContext(command, wallet.id, now),
+        ));
         await em.flush();
       });
     } catch (error) {
@@ -319,15 +323,13 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
         if (wallet.balance.isLessThan(money)) {
           transaction.reject(FailureCode.InsufficientBalance);
           const rejected = this.persistTransaction(em, transaction, wallet.balance.toJSON().amount, now);
-          this.persistOutbox(em, new WagerTransactionRejected(
-            randomUUID(), command.correlationId ?? transaction.id, now,
-            {
-              transactionId: transaction.id,
-              walletId: wallet.id,
-              balance: wallet.balance.toJSON(),
-              failureCode: FailureCode.InsufficientBalance,
-            },
-          ), transaction.id);
+          this.persistOutbox(em, WagerTransactionRejected.from(
+            transaction.id,
+            wallet.id,
+            wallet.balance.toJSON(),
+            FailureCode.InsufficientBalance,
+            this.eventContext(command, transaction.id, now),
+          ));
           await em.flush();
           return this.toTransactionView(rejected, false);
         }
@@ -357,19 +359,17 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
           balanceAfter: ledger.balanceAfter.toJSON().amount,
           createdAt: now,
         }));
-        this.persistOutbox(em, new WagerTransactionProcessed(
-          randomUUID(), command.correlationId ?? transaction.id, now,
-          { transactionId: transaction.id, walletId: wallet.id, balance: wallet.balance.toJSON() },
-        ), transaction.id);
-        this.persistOutbox(em, new WalletBalanceChanged(
-          randomUUID(), command.correlationId ?? transaction.id, now,
-          {
-            walletId: wallet.id,
-            previousBalance: ledger.balanceBefore.toJSON(),
-            balance: ledger.balanceAfter.toJSON(),
-            transactionId: transaction.id,
-          },
-        ), wallet.id);
+        this.persistOutbox(em, WagerTransactionProcessed.from(
+          transaction.id,
+          wallet.id,
+          wallet.balance.toJSON(),
+          this.eventContext(command, transaction.id, now),
+        ));
+        this.persistOutbox(em, WalletBalanceChanged.from(
+          wallet,
+          ledger,
+          this.eventContext(command, transaction.id, now),
+        ));
         await em.flush();
         await this.interceptUnitOfWork('before-commit', em);
         return this.toTransactionView(processed, false);
@@ -463,19 +463,29 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
     return record;
   }
 
-  private persistOutbox(em: EntityManager, event: IntegrationEvent<Record<string, unknown>>, aggregateId: string): void {
+  /**
+   * One event context per emitted event: a fresh stable eventId, the caller correlationId
+   * (defaulting to the aggregate it belongs to) and the optional causationId.
+   */
+  private eventContext(
+    command: { readonly correlationId?: string; readonly causationId?: string },
+    fallbackCorrelationId: string,
+    occurredAt: Date,
+  ): EventContext {
+    return {
+      eventId: randomUUID(),
+      correlationId: command.correlationId ?? fallbackCorrelationId,
+      ...(command.causationId === undefined ? {} : { causationId: command.causationId }),
+      occurredAt,
+    };
+  }
+
+  private persistOutbox(em: EntityManager, event: IntegrationEvent<unknown>): void {
     em.persist(em.create(OutboxMessageRecord, {
-      id: event.id,
-      aggregateId,
-      eventType: event.type,
-      payload: {
-        id: event.id,
-        type: event.type,
-        version: event.version,
-        correlationId: event.correlationId,
-        occurredAt: event.occurredAt.toISOString(),
-        payload: event.payload,
-      },
+      id: event.eventId,
+      aggregateId: event.aggregateId,
+      eventType: event.eventType,
+      payload: event.toJSON(),
       occurredAt: event.occurredAt,
       attempts: 0,
       nextAttemptAt: null,
@@ -512,4 +522,4 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
   }
 }
 
-export { canonicalJson, payloadHash };
+export { canonicalJson, isUuid, payloadHash };

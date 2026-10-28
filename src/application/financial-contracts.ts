@@ -5,6 +5,7 @@ export interface OpenWalletCommand {
   readonly playerId: string;
   readonly initialBalance: MoneyProps;
   readonly correlationId?: string;
+  readonly causationId?: string;
 }
 
 export interface ProcessBetCommand {
@@ -18,6 +19,7 @@ export interface ProcessBetCommand {
   readonly kind: 'BET';
   readonly money: MoneyProps;
   readonly correlationId?: string;
+  readonly causationId?: string;
 }
 
 export interface WalletView {

@@ -17,6 +17,10 @@ let orm: MikroORM<PostgreSqlDriver>;
 let server: ReturnType<typeof Bun.spawn>;
 let baseUrl: string;
 let wallet: { id: string; playerId: string };
+let uuidV7Wallet: { id: string; playerId: string };
+
+/** CP2B-1-R3 FIX-01: the exact UUIDv7 player identifier used by CHALLENGE.md. */
+const CHALLENGE_PLAYER_ID = '0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1';
 
 function uuid(suffix: number): string {
   return `00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
@@ -330,5 +334,61 @@ describe('CP2B-1-R1 HTTP end to end', () => {
       expect(response.status).toBe(404);
     }
     expect(walletState.body).toMatchObject({ balance: { amount: '75.00', currency: 'BRL' }, version: 2 });
+  });
+
+  test('TEST-02 case 11 (FIX-01): POST /wallets accepts the exact UUIDv7 playerId from CHALLENGE.md', async () => {
+    const created = await call('POST', '/wallets', {
+      body: { playerId: CHALLENGE_PLAYER_ID, initialBalance: { amount: '100.00', currency: 'BRL' } },
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({
+      playerId: CHALLENGE_PLAYER_ID,
+      balance: { amount: '100.00', currency: 'BRL' },
+      version: 1,
+    });
+
+    uuidV7Wallet = { id: created.body.id as string, playerId: CHALLENGE_PLAYER_ID };
+
+    const fetched = await call('GET', `/wallets/${uuidV7Wallet.id}`);
+    expect(fetched.status).toBe(200);
+    expect(fetched.body).toEqual(created.body);
+  });
+
+  test('TEST-02 case 12 (FIX-01): POST /wagering/transactions debits a BET for the UUIDv7 player', async () => {
+    const processed = await call('POST', '/wagering/transactions', {
+      idempotencyKey: 'http-uuidv7-key',
+      body: {
+        providerId: 'provider-http',
+        externalTransactionId: 'external-http-uuidv7',
+        walletId: uuidV7Wallet.id,
+        playerId: CHALLENGE_PLAYER_ID,
+        roundId: 'round-http-uuidv7',
+        gameId: 'game-http',
+        kind: 'BET',
+        money: { amount: '25.00', currency: 'BRL' },
+      },
+    });
+
+    expect(processed.status).toBe(200);
+    expect(processed.body).toMatchObject({
+      status: 'PROCESSED',
+      playerId: CHALLENGE_PLAYER_ID,
+      walletId: uuidV7Wallet.id,
+      balance: { amount: '75.00', currency: 'BRL' },
+      idempotentReplay: false,
+    });
+
+    const walletState = await call('GET', `/wallets/${uuidV7Wallet.id}`);
+    expect(walletState.body).toMatchObject({
+      playerId: CHALLENGE_PLAYER_ID,
+      balance: { amount: '75.00', currency: 'BRL' },
+      version: 2,
+    });
+
+    const persisted = await orm.em.getConnection().execute(`
+      select player_id::text as player_id from wager_transactions where id = '${processed.body.transactionId as string}'
+    `) as Array<{ player_id: string }>;
+    expect(persisted).toEqual([{ player_id: CHALLENGE_PLAYER_ID }]);
   });
 });
