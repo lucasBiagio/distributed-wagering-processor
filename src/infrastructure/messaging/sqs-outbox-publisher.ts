@@ -232,9 +232,10 @@ export class SqsOutboxPublisher {
   }
 
   private async scheduleRetry(message: ClaimedOutboxMessage, error: unknown): Promise<Date | null> {
-    const rawDelay = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** Math.min(message.attempts, 20));
-    const jitter = Math.floor(rawDelay * (Math.random() * 0.2));
-    const nextAttemptAt = new Date(Date.now() + rawDelay + jitter);
+    const baseDelay = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** Math.min(message.attempts, 20));
+    const maxJitter = Math.min(Math.floor(baseDelay * 0.2), this.retryMaxMs - baseDelay);
+    const jitter = Math.floor(maxJitter * Math.random());
+    const nextAttemptAt = new Date(Date.now() + baseDelay + jitter);
     const result = await this.orm.em.getConnection().execute(
       `update outbox_messages
           set attempts = attempts + 1,

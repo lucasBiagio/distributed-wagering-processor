@@ -13,7 +13,10 @@ import { PostgreSqlDriver } from '@mikro-orm/postgresql';
 
 import { SqsOutboxPublisher } from '../../src/infrastructure/messaging/sqs-outbox-publisher.js';
 import config from '../../src/infrastructure/persistence/mikro-orm.config.js';
-import { MikroOrmFinancialProcessing } from '../../src/infrastructure/persistence/mikro-orm-financial-processing.js';
+import {
+  MikroOrmFinancialProcessing,
+  type UnitOfWorkStage,
+} from '../../src/infrastructure/persistence/mikro-orm-financial-processing.js';
 
 interface OutboxRow {
   readonly id: string;
@@ -25,6 +28,14 @@ interface OutboxRow {
   readonly published_at: Date | null;
   readonly claim_token: string | null;
   readonly lease_expires_at: Date | null;
+}
+
+class FailingBeforeCommitProcessing extends MikroOrmFinancialProcessing {
+  protected override async interceptUnitOfWork(stage: UnitOfWorkStage): Promise<void> {
+    if (stage === 'before-commit') {
+      throw new Error('injected failure before commit');
+    }
+  }
 }
 
 let orm: MikroORM<PostgreSqlDriver>;
@@ -203,6 +214,39 @@ describe('CP3B transactional outbox publisher with real PostgreSQL and LocalStac
     expect((await rows(opened.id)).every((row) => row.published_at !== null)).toBe(true);
   });
 
+  test('TEST-B1: an injected failure after partial persistence but before commit rolls back financial and outbox rows, so the publisher cannot publish the aborted operation', async () => {
+    const opened = await wallet();
+    const before = await rows(opened.id);
+    const failing = new FailingBeforeCommitProcessing(orm);
+
+    await expect(failing.processBet({
+      providerId: 'cp3b-provider',
+      externalTransactionId: 'aborted-before-commit',
+      idempotencyKey: 'key-aborted-before-commit',
+      walletId: opened.id,
+      playerId: opened.playerId,
+      roundId: 'round-aborted-before-commit',
+      gameId: 'outbox-game',
+      kind: 'BET',
+      money: { amount: '10.00', currency: 'BRL' },
+    })).rejects.toThrow('injected failure before commit');
+
+    expect(await rows(opened.id)).toEqual(before);
+    const abortedTransactions = await orm.em.getConnection().execute(
+      "select count(*)::int as count from wager_transactions where idempotency_key = 'key-aborted-before-commit'",
+    ) as Array<{ count: number }>;
+    const abortedOutbox = await orm.em.getConnection().execute(
+      "select count(*)::int as count from outbox_messages where payload->>'correlationId' = 'key-aborted-before-commit'",
+    ) as Array<{ count: number }>;
+    expect(abortedTransactions[0]!.count).toBe(0);
+    expect(abortedOutbox[0]!.count).toBe(0);
+
+    const result = await publisher().drain({ stopWhenIdle: true });
+    expect(result.confirmed).toBe(before.length);
+    const delivered = await receiveAll(before.length);
+    expect(delivered.some((message) => JSON.parse(message.body).eventId === 'aborted-before-commit')).toBe(false);
+  });
+
   test('TEST-C: two independent Bun publishers cannot hold valid claims for the same outbox event', async () => {
     const opened = await wallet();
     await bet(opened.id, opened.playerId, 'concurrent');
@@ -276,22 +320,40 @@ describe('CP3B transactional outbox publisher with real PostgreSQL and LocalStac
     expect((await rows(opened.id)).find((row) => row.id === target.id)!.published_at).not.toBeNull();
   });
 
-  test('TEST-F: an SQS failure persists attempts and exponential retry scheduling before a later successful publish', async () => {
+  test('TEST-F: an SQS failure persists attempts and a final delay capped at retryMaxMs before a later successful publish', async () => {
     const opened = await wallet();
+    const originalRandom = Math.random;
+    const originalNow = Date.now;
+    const startedAt = 1_000_000;
+    let failing: SqsOutboxPublisher;
     const unavailable = new SQSClient({
       region: 'us-east-1',
       endpoint: 'http://127.0.0.1:1',
       credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
-      requestHandler: { handle: async () => { throw new Error('test SQS unavailable'); } },
+      requestHandler: {
+        handle: async () => {
+          Date.now = () => startedAt;
+          failing.stopAcceptingClaims();
+          throw new Error('test SQS unavailable');
+        },
+      },
     });
-    const failing = new SqsOutboxPublisher(unavailable, orm, { queueUrl, leaseMs: 100, retryBaseMs: 20, retryMaxMs: 50 });
-    await failing.drain({ stopWhenIdle: true });
+    await orm.em.getConnection().execute('update outbox_messages set attempts = 10 where wallet_id = ?', [opened.id]);
+    failing = new SqsOutboxPublisher(unavailable, orm, { queueUrl, leaseMs: 100, retryBaseMs: 20, retryMaxMs: 50 });
+    Math.random = () => 0.99;
+    try {
+      await failing.drain({ stopWhenIdle: true });
+    } finally {
+      Math.random = originalRandom;
+      Date.now = originalNow;
+    }
     const failed = await rows(opened.id);
     expect(failed[0]!.published_at).toBeNull();
-    expect(failed[0]!.attempts).toBe(1);
+    expect(failed[0]!.attempts).toBe(11);
     expect(failed[0]!.next_attempt_at).not.toBeNull();
+    expect(new Date(failed[0]!.next_attempt_at!).getTime()).toBeLessThanOrEqual(startedAt + 50);
     expect(failed[0]!.claim_token).toBeNull();
-    expect(failed.slice(1).every((row) => row.published_at === null && row.attempts === 0 && row.claim_token === null)).toBe(true);
+    expect(failed.slice(1).every((row) => row.published_at === null && row.attempts === 10 && row.claim_token === null)).toBe(true);
     await unavailable.destroy();
 
     await Bun.sleep(60);
