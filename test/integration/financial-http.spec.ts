@@ -200,6 +200,28 @@ describe('CP2B-1-R1 HTTP end to end', () => {
     expect(walletState.body).toMatchObject({ balance: { amount: '75.00', currency: 'BRL' }, version: 2 });
   });
 
+  test('TEST-02 case 2a: POST /wagering/transactions accepts LOSS 0.00 without changing the wallet', async () => {
+    const processed = await call('POST', '/wagering/transactions', {
+      idempotencyKey: 'http-loss-zero-key',
+      body: betBody({
+        kind: 'LOSS',
+        externalTransactionId: 'external-http-loss-zero',
+        roundId: 'round-http-loss-zero',
+        money: { amount: '0.00', currency: 'BRL' },
+      }),
+    });
+    const walletState = await call('GET', `/wallets/${wallet.id}`);
+
+    expect(processed.status).toBe(200);
+    expect(processed.body).toMatchObject({
+      kind: 'LOSS',
+      status: 'PROCESSED',
+      balance: { amount: '75.00', currency: 'BRL' },
+      idempotentReplay: false,
+    });
+    expect(walletState.body).toMatchObject({ balance: { amount: '75.00', currency: 'BRL' }, version: 2 });
+  });
+
   test('TEST-02 case 3: the same Idempotency-Key and payload replays the stored result', async () => {
     const replay = await call('POST', '/wagering/transactions', {
       idempotencyKey: 'http-base-key',

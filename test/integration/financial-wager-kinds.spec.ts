@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from 'node:crypto';
+
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MikroORM } from '@mikro-orm/core';
 import { PostgreSqlDriver } from '@mikro-orm/postgresql';
@@ -45,6 +47,31 @@ function player(suffix: number): string {
 function nextSuffix(): number {
   sequence += 1;
   return sequence;
+}
+
+/** Exact CP2B-1 BET hash fixture: referenceExternalTransactionId did not exist in this payload. */
+function legacyCp2b1BetPayloadHash(command: {
+  readonly providerId: string;
+  readonly externalTransactionId: string;
+  readonly walletId: string;
+  readonly playerId: string;
+  readonly roundId: string;
+  readonly gameId: string;
+  readonly money: { readonly amount: string; readonly currency: string };
+}): string {
+  const payload = {
+    amount: command.money.amount,
+    currency: command.money.currency,
+    externalTransactionId: command.externalTransactionId,
+    gameId: command.gameId,
+    kind: 'BET',
+    playerId: command.playerId,
+    providerId: command.providerId,
+    roundId: command.roundId,
+    walletId: command.walletId,
+  };
+  const canonical = `{${Object.keys(payload).sort().map((key) => `${JSON.stringify(key)}:${JSON.stringify(payload[key as keyof typeof payload])}`).join(',')}}`;
+  return createHash('sha256').update(canonical).digest('hex');
 }
 
 async function wallet(balance: string): Promise<{ id: string; playerId: string }> {
@@ -183,6 +210,46 @@ describe('CP2B-2 wager kinds', () => {
     expect(await eventTypes('corr-loss-1')).toEqual(['WagerTransactionProcessed']);
   });
 
+  test('LOSS with 0.00 is PROCESSED without balance movement, ledger entry or version increment', async () => {
+    const target = await wallet('100.00');
+
+    const loss = await processing.processWager({
+      idempotencyKey: 'loss-zero-1',
+      providerId: 'provider-a',
+      externalTransactionId: 'ext-loss-zero-1',
+      walletId: target.id,
+      playerId: target.playerId,
+      roundId: 'round-loss-zero-1',
+      gameId: 'fortune-chimp',
+      kind: 'LOSS',
+      money: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'corr-loss-zero-1',
+    });
+
+    expect(loss).toMatchObject({
+      status: WagerTransactionStatus.Processed,
+      balance: { amount: '100.00', currency: 'BRL' },
+      idempotentReplay: false,
+    });
+    expect(await walletRow(target.id)).toEqual({ balance: '100.00', version: 1 });
+    expect((await ledgerOf(target.id)).filter((entry) => entry.transaction_id === loss.transactionId)).toEqual([]);
+    expect(await eventTypes('corr-loss-zero-1')).toEqual(['WagerTransactionProcessed']);
+
+    const replay = await processing.processWager({
+      idempotencyKey: 'loss-zero-1',
+      providerId: 'provider-a',
+      externalTransactionId: 'ext-loss-zero-1',
+      walletId: target.id,
+      playerId: target.playerId,
+      roundId: 'round-loss-zero-1',
+      gameId: 'fortune-chimp',
+      kind: 'LOSS',
+      money: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'corr-loss-zero-1',
+    });
+    expect(replay).toEqual({ ...loss, idempotentReplay: true });
+  });
+
   test('REFUND of a processed BET credits the wallet once and links the internal reference', async () => {
     const target = await wallet('100.00');
 
@@ -271,6 +338,116 @@ describe('CP2B-2 wager kinds', () => {
 
     const ledger = await ledgerOf(target.id);
     expect(ledger.filter((entry) => entry.transaction_id === first.transactionId).length).toBe(1);
+  });
+
+  test('replaying a CP2B-1 persisted BET hash remains idempotent after CP2B-2', async () => {
+    const walletId = randomUUID();
+    const playerId = player(nextSuffix());
+    const transactionId = randomUUID();
+    const command = {
+      idempotencyKey: 'legacy-bet-replay',
+      providerId: 'provider-a',
+      externalTransactionId: 'ext-legacy-bet-replay',
+      walletId,
+      playerId,
+      roundId: 'round-legacy-bet-replay',
+      gameId: 'fortune-chimp',
+      kind: 'BET' as const,
+      money: { amount: '25.00', currency: 'BRL' },
+    };
+    const legacyHash = legacyCp2b1BetPayloadHash(command);
+    const connection = orm.em.getConnection();
+    await connection.execute(
+      `insert into wallets (id, player_id, currency, balance, version, created_at, updated_at)
+       values (?, ?, 'BRL', 75.00, 2, now(), now())`,
+      [walletId, playerId],
+    );
+    await connection.execute(
+      `insert into wager_transactions (
+         id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+         wallet_id, player_id, round_id, game_id, kind, amount, currency,
+         status, processed_at, resulting_balance, reference_next_attempt_at, created_at
+       ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'BET', 25.00, 'BRL', 'PROCESSED', now(), 75.00, null, now())`,
+      [
+        transactionId,
+        command.providerId,
+        command.externalTransactionId,
+        command.idempotencyKey,
+        legacyHash,
+        walletId,
+        playerId,
+        command.roundId,
+        command.gameId,
+      ],
+    );
+    await connection.execute(
+      `insert into wallet_ledger_entries (
+         id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at
+       ) values (?, ?, ?, 'DEBIT', 25.00, 'BRL', 100.00, 75.00, now())`,
+      [randomUUID(), walletId, transactionId],
+    );
+    const before = await connection.execute(
+      `select
+         (select count(*)::int from wallet_ledger_entries where wallet_id = ?) as ledger_count,
+         (select count(*)::int from outbox_messages) as outbox_count`,
+      [walletId],
+    ) as Array<{ ledger_count: number; outbox_count: number }>;
+
+    const replay = await processing.processWager(command);
+
+    expect(replay).toMatchObject({
+      transactionId,
+      status: WagerTransactionStatus.Processed,
+      balance: { amount: '75.00', currency: 'BRL' },
+      idempotentReplay: true,
+    });
+    expect(await walletRow(walletId)).toEqual({ balance: '75.00', version: 2 });
+    expect(await connection.execute(
+      `select
+         (select count(*)::int from wallet_ledger_entries where wallet_id = ?) as ledger_count,
+         (select count(*)::int from outbox_messages) as outbox_count`,
+      [walletId],
+    )).toEqual(before);
+
+    await expect(processing.processWager({
+      ...command,
+      money: { amount: '26.00', currency: 'BRL' },
+    })).rejects.toBeInstanceOf(FinancialConflictError);
+  });
+
+  test('reversal idempotency hashes include the referenced external transaction', async () => {
+    const target = await wallet('100.00');
+    for (const externalTransactionId of ['ext-reference-hash-a', 'ext-reference-hash-b']) {
+      await processing.processWager({
+        idempotencyKey: `bet-${externalTransactionId}`,
+        providerId: 'provider-a',
+        externalTransactionId,
+        walletId: target.id,
+        playerId: target.playerId,
+        roundId: `round-${externalTransactionId}`,
+        gameId: 'fortune-chimp',
+        kind: 'BET',
+        money: { amount: '10.00', currency: 'BRL' },
+      });
+    }
+    const refund = {
+      idempotencyKey: 'reference-hash-refund',
+      providerId: 'provider-a',
+      externalTransactionId: 'ext-reference-hash-refund',
+      walletId: target.id,
+      playerId: target.playerId,
+      roundId: 'round-ext-reference-hash-a',
+      gameId: 'fortune-chimp',
+      kind: 'REFUND' as const,
+      money: { amount: '10.00', currency: 'BRL' },
+      referenceExternalTransactionId: 'ext-reference-hash-a',
+    };
+    await processing.processWager(refund);
+
+    await expect(processing.processWager({
+      ...refund,
+      referenceExternalTransactionId: 'ext-reference-hash-b',
+    })).rejects.toBeInstanceOf(FinancialConflictError);
   });
 
   test('a second REFUND for the same BET under a new key is rejected as already reversed', async () => {

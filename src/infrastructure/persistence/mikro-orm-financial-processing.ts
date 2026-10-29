@@ -65,7 +65,9 @@ function payloadHash(command: ProcessWagerCommand): string {
     kind: command.kind,
     playerId: command.playerId,
     providerId: command.providerId,
-    referenceExternalTransactionId: command.referenceExternalTransactionId ?? null,
+    ...(command.kind === 'REFUND' || command.kind === 'ROLLBACK'
+      ? { referenceExternalTransactionId: command.referenceExternalTransactionId }
+      : {}),
     roundId: command.roundId,
     walletId: command.walletId,
   };
@@ -793,10 +795,11 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
     if (!(command.kind in KIND_BY_INPUT)) {
       throw new DomainRuleError('INVALID_TRANSACTION', `Unsupported transaction kind ${command.kind}`);
     }
-    if (!Money.from(command.money).isPositive()) {
+    const kind = KIND_BY_INPUT[command.kind];
+    const money = Money.from(command.money);
+    if (!money.isPositive() && !(kind === WagerTransactionKind.Loss && money.isZero())) {
       throw new DomainRuleError('INVALID_TRANSACTION', `${command.kind} amount must be positive`);
     }
-    const kind = KIND_BY_INPUT[command.kind];
     const needsReference = REVERSAL_KINDS.includes(kind);
     if (needsReference) {
       assertNonBlank(command.referenceExternalTransactionId ?? '', 'referenceExternalTransactionId');
