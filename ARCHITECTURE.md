@@ -139,3 +139,26 @@ FIFO `MessageGroupId = walletId` is required for test producers to reduce broker
 Shutdown first disables acceptance and aborts the outstanding long poll, then waits for deliveries already in progress. It does not manufacture acknowledgements. Therefore an interrupted pre-commit delivery has no persisted inbox/effect and is safely redelivered; an interrupted post-commit/pre-ACK delivery follows the inbox recovery path.
 
 The CP3A real integration suite uses disposable PostgreSQL databases plus disposable LocalStack FIFO source/DLQ queues. It covers commit/ACK ordering, duplicate delivery, forced pre-commit rollback, insufficient-balance rejection, pending reference sweep, native DLQ redrive, a deterministic crash after commit before ACK across worker processes, three independent worker processes, and HTTP-to-SQS replay. Full outbox publishing, publisher retries, and reconciliation remain reserved for CP3B.
+
+## CP3B transactional outbox publisher
+
+CP3B closes the outbox boundary by publishing persisted event envelopes to `wager-events.fifo` in a standalone process. Its execution path is intentionally separate from financial processing:
+
+```text
+committed PostgreSQL transaction
+  -> outbox_messages (immutable event envelope + wallet_id + enqueue_sequence)
+  -> short claim transaction: FOR UPDATE SKIP LOCKED + claim_token + lease_expires_at
+  -> COMMIT claim
+  -> SQS SendMessage (MessageGroupId = walletId, MessageDeduplicationId = eventId)
+  -> fenced confirmation: UPDATE ... WHERE id = ? AND claim_token = ?
+```
+
+The network call occurs after the claim transaction commits; no SQL transaction remains open during SQS I/O. The claim query excludes an event while any earlier unpublished `enqueue_sequence` for that same `wallet_id` remains, which supplies durable per-wallet ordering independently of equal `occurredAt` timestamps. Independent wallets may progress concurrently. The SQS FIFO group is a matching transport-ordering constraint, not the sole ordering authority.
+
+`claim_token` is a fencing token. Both confirmation and retry scheduling include the token in their `WHERE` clause, so a prior owner cannot clear, publish, or reschedule a row that has been reclaimed after lease expiry. Retry state (`attempts`, `next_attempt_at`) is persisted and uses capped exponential backoff with jitter. A crash after claim leaves the lease for a later publisher to reclaim. A crash after SQS accepts the send but before database confirmation leaves `published_at` empty; recovery deliberately republishes the unchanged persisted envelope and stable `eventId`.
+
+The publisher normally runs continuously. An empty claim result sleeps for a bounded interval before retrying; it does not terminate or spin in a busy loop. `OUTBOX_PUBLISHER_STOP_WHEN_IDLE=true` is the explicit bounded-run mode, used by CI and batch jobs, and exits only after an empty eligible claim. `SIGINT`/`SIGTERM` disable new claims and permit the in-flight controlled path to reach its durable outcome before resources close.
+
+This is **at-least-once** delivery. SQS FIFO's deduplication window can reduce duplicate broker acceptance but cannot prove exactly-once publication across a post-acceptance crash. The downstream consumer must persist and enforce deduplication by application `eventId`. The publisher sends the exact persisted envelope; it never regenerates IDs/timestamps/money or derives an event from current wallet state.
+
+The CP3B integration suite runs against disposable PostgreSQL and LocalStack resources. It validates real SQS publication, commit boundary, competing publishers, crash recovery before/after SQS acceptance, persisted retry, ordering, restart recovery, persisted envelope identity, and durable downstream `eventId` deduplication. CP3B migration reversibility is checked as `UP → DOWN → UP` only on a disposable database.

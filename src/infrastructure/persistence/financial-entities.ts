@@ -57,11 +57,15 @@ export class InboxMessageRecord {
 export class OutboxMessageRecord {
   public id!: string;
   public aggregateId!: string;
+  public walletId!: string;
+  public enqueueSequence?: string;
   public eventType!: string;
   public payload!: Record<string, unknown>;
   public occurredAt!: Date;
   public attempts!: number;
   public nextAttemptAt!: Date | null;
+  public claimToken!: string | null;
+  public leaseExpiresAt!: Date | null;
   public publishedAt!: Date | null;
 }
 
@@ -141,11 +145,19 @@ export const OutboxMessageRecordSchema = new EntitySchema<OutboxMessageRecord>({
   properties: {
     id: { type: 'uuid', primary: true },
     aggregateId: { type: 'uuid', fieldName: 'aggregate_id' },
+    walletId: { type: 'uuid', fieldName: 'wallet_id' },
+    enqueueSequence: {
+      type: 'bigint',
+      fieldName: 'enqueue_sequence',
+      defaultRaw: "nextval('outbox_messages_enqueue_sequence_seq')",
+    },
     eventType: { type: String, fieldName: 'event_type' },
     payload: { type: 'json' },
     occurredAt: { type: Date, fieldName: 'occurred_at' },
     attempts: { type: Number },
     nextAttemptAt: { type: Date, fieldName: 'next_attempt_at', nullable: true },
+    claimToken: { type: 'uuid', fieldName: 'claim_token', nullable: true },
+    leaseExpiresAt: { type: Date, fieldName: 'lease_expires_at', nullable: true },
     publishedAt: { type: Date, fieldName: 'published_at', nullable: true },
   },
 });

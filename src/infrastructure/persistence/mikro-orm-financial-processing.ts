@@ -974,14 +974,22 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
   }
 
   private persistOutbox(em: EntityManager, event: IntegrationEvent<unknown>): void {
+    const walletId = (event.data as { readonly walletId?: unknown }).walletId;
+    if (typeof walletId !== 'string' || !isUuid(walletId)) {
+      throw new Error(`Integration event ${event.eventType} is missing its persisted walletId`);
+    }
+
     em.persist(em.create(OutboxMessageRecord, {
       id: event.eventId,
       aggregateId: event.aggregateId,
+      walletId,
       eventType: event.eventType,
       payload: event.toJSON(),
       occurredAt: event.occurredAt,
       attempts: 0,
       nextAttemptAt: null,
+      claimToken: null,
+      leaseExpiresAt: null,
       publishedAt: null,
     }));
   }

@@ -222,3 +222,41 @@ bun run test
 ```
 
 `test/integration/sqs-inbox.spec.ts` uses real PostgreSQL and LocalStack to cover valid delivery, redelivery, crash-after-commit-before-ACK across two worker processes, pre-commit rollback, durable rejection, pending reference/recovery, real redrive to FIFO DLQ, three worker processes, and HTTP-equivalent-to-SQS financial replay. The `CP3A_TEST_CRASH_AFTER_COMMIT_BEFORE_ACK` and `SQS_CONSUMER_EXIT_AFTER_ACKS` environment variables are test-only process controls; they are not application APIs.
+
+## CP3B transactional outbox publisher
+
+CP3B publishes the financial outbox to the FIFO queue `wager-events.fifo`. Start it as a separate process only after PostgreSQL and SQS are healthy:
+
+```bash
+bun run scripts/cp3b-outbox-publisher.ts
+```
+
+The default mode is continuous: an empty outbox is temporary, so the process waits and continues claiming when a later committed event becomes eligible. `SIGINT` and `SIGTERM` stop new claims, allow work already claimed to finish its current controlled path, then close SQS and MikroORM resources. For a bounded batch/CI invocation, set `OUTBOX_PUBLISHER_STOP_WHEN_IDLE=true`; it exits only after no eligible row remains and no currently claimed batch is still being processed.
+
+Configuration defaults are intentionally production-safe:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WAGER_EVENTS_QUEUE_NAME` | `wager-events.fifo` | FIFO queue name when a URL is not supplied |
+| `WAGER_EVENTS_QUEUE_URL` | unset | Explicit queue URL; preferred for isolated tests |
+| `OUTBOX_PUBLISHER_BATCH_SIZE` | `20` | Maximum ready rows claimed in one iteration (1–100) |
+| `OUTBOX_PUBLISHER_LEASE_MS` | `30000` | Durable lease duration for a claim |
+| `OUTBOX_PUBLISHER_RETRY_BASE_MS` | `1000` | Retry base delay and idle wait cap |
+| `OUTBOX_PUBLISHER_RETRY_MAX_MS` | `60000` | Maximum exponential retry delay |
+
+Every claim is selected in a short PostgreSQL transaction with `FOR UPDATE SKIP LOCKED`. The publisher records a lease and unique fencing token, commits that claim, and only then calls SQS; it never holds a SQL transaction open over the network call. Confirmation and retry updates require the same `(id, claim_token)` fencing pair, so an expired owner cannot overwrite a newer claim. A failure schedules a persisted exponential delay with bounded jitter, increments `attempts`, and releases the lease. A crash after claim is recovered after lease expiry; a crash after SQS accepts a message but before `published_at` is stored is recovered by republishing the exact persisted envelope with the same `eventId`.
+
+Per-wallet ordering is database-enforced by persisted `enqueue_sequence`: a row is claimable only when no older unpublished row for its `walletId` exists. SQS receives `MessageGroupId = walletId` and `MessageDeduplicationId = eventId`. The published body is the stored event envelope; the publisher does not regenerate `eventId`, `occurredAt`, or monetary values, and does not reconstruct an event from current wallet balance.
+
+Delivery is **at least once**, not exactly once. A post-acceptance crash can produce a duplicate delivery despite FIFO's five-minute deduplication window; downstream consumers must durably deduplicate on the stable application `eventId`. FIFO ordering and broker deduplication reduce transport disorder and duplication but do not replace durable consumer idempotency.
+
+Run CP3B validation only against a disposable isolated PostgreSQL database and disposable LocalStack FIFO queues:
+
+```bash
+bun run typecheck
+bun run build
+bun test test/integration/sqs-outbox-publisher.spec.ts --timeout 60000
+bun run test
+```
+
+The CP3B integration suite uses real PostgreSQL and LocalStack for committed-row publication, pre-commit exclusion, concurrent publishers, crash recovery before and after SQS acceptance, persisted retry, wallet ordering, restart recovery, exact envelope preservation, and durable downstream `eventId` deduplication. Migration reversibility (`UP → DOWN → UP`) must likewise be checked only on a disposable database; never run migration down against a development or production database.
