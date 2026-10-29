@@ -141,6 +141,17 @@ async function counts(walletId: string): Promise<{ inbox: number; ledger: number
   return rows[0]!;
 }
 
+async function inboxSnapshot(messageId: string): Promise<{ messageId: string; payloadHash: string; receivedAt: string; processedAt: string }> {
+  const rows = await orm.em.getConnection().execute(
+    `select message_id as "messageId", payload_hash as "payloadHash", received_at::text as "receivedAt", processed_at::text as "processedAt"
+       from inbox_messages
+      where consumer_name = ? and message_id = ?`,
+    [WAGER_TRANSACTION_CONSUMER_NAME, messageId],
+  ) as Array<{ messageId: string; payloadHash: string; receivedAt: string; processedAt: string }>;
+  expect(rows).toHaveLength(1);
+  return rows[0]!;
+}
+
 async function queueIsEmpty(queueUrl: string): Promise<boolean> {
   const message = await client.send(new ReceiveMessageCommand({ QueueUrl: queueUrl, WaitTimeSeconds: 0, MaxNumberOfMessages: 1 }));
   return (message.Messages ?? []).length === 0;
@@ -206,6 +217,59 @@ describe('CP3A SQS transactional inbox with real PostgreSQL and LocalStack', () 
     await new SqsWagerConsumer(client, processing).run({ maxAcknowledgements: 1 });
     expect(await counts(wallet.id)).toEqual({ inbox: 1, ledger: 2, outbox: 4, transactions: 2 });
     expect(await processing.getWallet(wallet.id)).toMatchObject({ balance: { amount: '75.00', currency: 'BRL' }, version: 2 });
+    expect(await queueIsEmpty(queues.queueUrl)).toBe(true);
+  });
+
+  test('TEST-R1: conflicting payload is never ACKed, leaves financial state and inbox immutable, and reaches the real FIFO DLQ', async () => {
+    const wallet = await openWallet();
+    const original = envelope({ data: { walletId: wallet.id, playerId: wallet.playerId } });
+    await publish(original, wallet.id);
+    await new SqsWagerConsumer(client, processing).run({ maxAcknowledgements: 1 });
+
+    const beforeCounts = await counts(wallet.id);
+    const beforeWallet = await processing.getWallet(wallet.id);
+    const beforeInbox = await inboxSnapshot(original.messageId);
+    const conflicting = {
+      ...original,
+      data: {
+        ...original.data,
+        money: { amount: '26.00', currency: 'BRL' },
+      },
+    };
+    await publish(conflicting, wallet.id, randomUUID());
+
+    const logLines: string[] = [];
+    const originalConsoleInfo = console.info;
+    console.info = (...args: unknown[]) => logLines.push(args.map(String).join(' '));
+    const consumer = new SqsWagerConsumer(client, processing);
+    const run = consumer.run();
+    let dlqBody: string | undefined;
+    try {
+      await waitFor(async () => {
+        const delivery = await client.send(new ReceiveMessageCommand({
+          QueueUrl: queues.dlqUrl,
+          WaitTimeSeconds: 0,
+          MaxNumberOfMessages: 1,
+        }));
+        dlqBody = delivery.Messages?.[0]?.Body;
+        return dlqBody !== undefined;
+      }, 15_000);
+    } finally {
+      await consumer.stop();
+      await run;
+      console.info = originalConsoleInfo;
+    }
+
+    expect(JSON.parse(dlqBody!)).toEqual(conflicting);
+    expect(await counts(wallet.id)).toEqual(beforeCounts);
+    expect(await processing.getWallet(wallet.id)).toEqual(beforeWallet);
+    expect(await inboxSnapshot(original.messageId)).toEqual(beforeInbox);
+    expect(logLines).toContain(JSON.stringify({ event: 'sqs_delivery_inbox_conflict', messageId: original.messageId, reason: 'inbox_payload_conflict' }));
+    expect(logLines).not.toContain(JSON.stringify({ event: 'sqs_delivery_inbox_conflict_acknowledged', messageId: original.messageId }));
+
+    await publish(original, wallet.id, randomUUID());
+    await new SqsWagerConsumer(client, processing).run({ maxAcknowledgements: 1 });
+    expect(await counts(wallet.id)).toEqual(beforeCounts);
     expect(await queueIsEmpty(queues.queueUrl)).toBe(true);
   });
 

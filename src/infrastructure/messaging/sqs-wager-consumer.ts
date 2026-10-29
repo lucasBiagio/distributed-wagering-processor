@@ -265,11 +265,13 @@ export class SqsWagerConsumer implements OnApplicationShutdown {
       return true;
     } catch (error) {
       if (error instanceof InboxPayloadConflictError) {
-        // The original inbox row is durable; a different payload under the same logical ID is
-        // terminal and must not be retried or allowed to affect financial state.
-        await this.client.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
-        structuredLog('sqs_delivery_inbox_conflict_acknowledged', { messageId: envelope.messageId });
-        return true;
+        // A changed payload under the same durable logical identity is permanent, but it is
+        // deliberately left unacknowledged so the SQS redrive policy can preserve it in DLQ.
+        structuredLog('sqs_delivery_inbox_conflict', {
+          messageId: envelope.messageId,
+          reason: 'inbox_payload_conflict',
+        });
+        return false;
       }
       if (permanentError(error)) {
         // Leave the message unacknowledged: SQS redrive policy owns bounded retries and DLQ.
