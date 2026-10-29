@@ -175,3 +175,50 @@ The canonical idempotency hash keeps CP2B-1 compatibility: BET payloads retain t
 A missing reversal-reference field is invalid input. A supplied reference that has not yet arrived is persisted as `PENDING_REFERENCE`: it has no wallet movement, ledger row, or `WalletBalanceChanged`, but it does receive a `WagerTransactionPendingReference` outbox event and a due retry timestamp. Sweeps use `FOR UPDATE SKIP LOCKED`, are batch-limited (default 50), and are idempotent. The retry delay is exponential from 5 seconds, capped at 5 minutes; resolution ends after 8 attempts or 24 hours, whichever occurs first, as terminal `REJECTED` with `REFERENCE_NOT_FOUND`. Arrival of the original reference followed by a sweep performs exactly one reversal transactionally.
 
 Run the CP2B-2 gates against disposable PostgreSQL and LocalStack services. `docker compose up -d postgres localstack` provides `SQS_ENDPOINT=http://localstack:4566` within Compose; host callers use `http://127.0.0.1:4566`. The sample credentials (`test`/`test`) are LocalStack-only placeholders, not production credentials. CP2B-2 persists outbox messages but intentionally does not implement an SQS publisher, consumer, acknowledgement loop, or DLQ behavior; those remain CP3.
+
+## CP3A SQS transactional inbox consumer
+
+CP3A adds the `WagerTransactionRequested` FIFO consumer only; it deliberately does **not** publish the outbox. Start the worker as a separate process after the Compose dependencies are healthy:
+
+```bash
+bun run scripts/cp3a-sqs-consumer.ts
+```
+
+The worker uses `wager-transactions.fifo` by default. Configure `WAGER_TRANSACTIONS_QUEUE_URL` for an isolated queue (the preferred integration-test path), or `WAGER_TRANSACTIONS_QUEUE_NAME` to resolve a named queue. `SQS_CONSUMER_CONCURRENCY` defaults to `4`; `SQS_CONSUMER_VISIBILITY_TIMEOUT_SECONDS` defaults to `5`. The worker long-polls SQS and uses each delivery's current `ReceiptHandle` for deletion.
+
+A producer must send a FIFO `MessageGroupId` equal to `walletId`; this reduces same-wallet broker reordering but is **not** the financial correctness boundary. PostgreSQL still serializes and validates wallet effects. The body is a strict JSON envelope:
+
+```json
+{
+  "messageId": "logical-delivery-id",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-10-29T03:00:00.000Z",
+  "data": {
+    "providerId": "provider-a",
+    "externalTransactionId": "external-1",
+    "idempotencyKey": "financial-key-1",
+    "playerId": "uuid",
+    "walletId": "uuid",
+    "roundId": "round-1",
+    "gameId": "game-1",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}
+```
+
+`messageId` above—not SQS's transport `MessageId`—is the durable inbox identity. The primary key remains `(consumer_name, message_id)`. The consumer canonicalizes and hashes this application envelope, inserts/verifies the inbox row, runs the existing financial processor, and persists wallet/transaction/ledger/outbox effects in **one PostgreSQL transaction**. A matching redelivery is an idempotent replay and receives an ACK without new effects; a changed payload for the same logical `messageId` is a terminal inbox conflict and is ACKed without any movement.
+
+ACK is `DeleteMessage` strictly after successful database commit. `PROCESSED`, durable `REJECTED`, and `PENDING_REFERENCE` are all commit-success outcomes and are ACKed. PostgreSQL/deadlock failures leave the message unacknowledged for visibility retry; invalid envelopes also remain unacknowledged so the FIFO queue's native redrive policy (`maxReceiveCount=5`) moves them to `wager-transactions-dlq.fifo`. No in-memory deduplication is used.
+
+On `SIGTERM`/`SIGINT`, the worker stops accepting polls, aborts an outstanding long poll, waits for already-running deliveries, then closes NestJS resources. It never ACKs before a commit; a crash after commit and before ACK is recovered by the inbox on the next delivery.
+
+Run all checks against a disposable PostgreSQL database and isolated disposable FIFO queues—never the development database or shared queue:
+
+```bash
+bun run typecheck
+bun run build
+bun run test
+```
+
+`test/integration/sqs-inbox.spec.ts` uses real PostgreSQL and LocalStack to cover valid delivery, redelivery, crash-after-commit-before-ACK across two worker processes, pre-commit rollback, durable rejection, pending reference/recovery, real redrive to FIFO DLQ, three worker processes, and HTTP-equivalent-to-SQS financial replay. The `CP3A_TEST_CRASH_AFTER_COMMIT_BEFORE_ACK` and `SQS_CONSUMER_EXIT_AFTER_ACKS` environment variables are test-only process controls; they are not application APIs.

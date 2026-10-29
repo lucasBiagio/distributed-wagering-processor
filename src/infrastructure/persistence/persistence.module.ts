@@ -3,6 +3,7 @@ import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { PostgreSqlDriver } from '@mikro-orm/postgresql';
 
 import { getAppConfig } from '../config.js';
+import { MikroOrmFinancialProcessing } from './mikro-orm-financial-processing.js';
 import { financialEntities } from './financial-entities.js';
 
 @Module({
@@ -22,5 +23,7 @@ import { financialEntities } from './financial-entities.js';
       },
     }),
   ],
+  providers: [MikroOrmFinancialProcessing],
+  exports: [MikroOrmFinancialProcessing],
 })
 export class PersistenceModule {}

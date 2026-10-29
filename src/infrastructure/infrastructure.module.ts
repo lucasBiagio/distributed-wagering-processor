@@ -12,6 +12,6 @@ import { PersistenceModule } from './persistence/persistence.module.js';
     { provide: 'POSTGRES_READINESS_PROBE', useExisting: PostgresReadinessProbe },
     { provide: 'SQS_READINESS_PROBE', useExisting: SqsReadinessProbe },
   ],
-  exports: ['POSTGRES_READINESS_PROBE', 'SQS_READINESS_PROBE'],
+  exports: [PersistenceModule, SqsModule, 'POSTGRES_READINESS_PROBE', 'SQS_READINESS_PROBE'],
 })
 export class InfrastructureModule {}

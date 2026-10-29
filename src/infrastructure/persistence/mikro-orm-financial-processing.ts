@@ -6,7 +6,9 @@ import { LockMode, type EntityManager, MikroORM } from '@mikro-orm/core';
 import {
   FinancialConflictError,
   FinancialNotFoundError,
+  InboxPayloadConflictError,
   type FinancialProcessingPort,
+  type InboxMessageCommand,
   type OpenWalletCommand,
   type PendingReferenceSweepOptions,
   type PendingReferenceSweepResult,
@@ -37,6 +39,7 @@ import {
   WagerTransactionStatus,
 } from '../../domain/wager-transaction.js';
 import {
+  InboxMessageRecord,
   OutboxMessageRecord,
   WalletLedgerEntryRecord,
   WalletRecord,
@@ -339,14 +342,45 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
    * path to keep consistent.
    */
   public async processWager(command: ProcessWagerCommand): Promise<ProcessWagerResult> {
+    return this.processWagerWithOptionalInbox(command);
+  }
+
+  /**
+   * SQS calls this path so inbox identity, wallet/ledger changes, wager state and outbox rows
+   * commit as one PostgreSQL transaction. HTTP deliberately uses the same implementation with
+   * no inbox command, preserving its contract and idempotency semantics.
+   */
+  public async processWagerWithInbox(
+    command: ProcessWagerCommand,
+    inbox: InboxMessageCommand,
+  ): Promise<ProcessWagerResult> {
+    return this.processWagerWithOptionalInbox(command, inbox);
+  }
+
+  private async processWagerWithOptionalInbox(
+    command: ProcessWagerCommand,
+    inbox?: InboxMessageCommand,
+  ): Promise<ProcessWagerResult> {
     this.validateWager(command);
     const hash = payloadHash(command);
 
     for (let attempt = 1; ; attempt += 1) {
       try {
-        return await this.runWagerUnitOfWork(command, hash);
+        return await this.runWagerUnitOfWork(command, hash, inbox);
       } catch (error) {
         if (uniqueViolation(error)) {
+          if (inbox) {
+            const duplicate = await this.orm.em.fork().findOne(InboxMessageRecord, {
+              consumerName: inbox.consumerName,
+              messageId: inbox.messageId,
+            });
+            if (duplicate) {
+              if (duplicate.payloadHash !== inbox.payloadHash) {
+                throw new InboxPayloadConflictError('Inbox messageId was already used with a different payload');
+              }
+              return this.processWager(command);
+            }
+          }
           return await this.resolveUniqueViolation(command, hash, error);
         }
         if (transientConflict(error) && attempt < MAX_BET_ATTEMPTS) {
@@ -357,8 +391,32 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
     }
   }
 
-  private async runWagerUnitOfWork(command: ProcessWagerCommand, hash: string): Promise<ProcessWagerResult> {
+  private async runWagerUnitOfWork(
+    command: ProcessWagerCommand,
+    hash: string,
+    inbox?: InboxMessageCommand,
+  ): Promise<ProcessWagerResult> {
     return this.orm.em.transactional(async (em) => {
+      if (inbox) {
+        const existingInbox = await em.findOne(InboxMessageRecord, {
+          consumerName: inbox.consumerName,
+          messageId: inbox.messageId,
+        });
+        if (existingInbox) {
+          if (existingInbox.payloadHash !== inbox.payloadHash) {
+            throw new InboxPayloadConflictError('Inbox messageId was already used with a different payload');
+          }
+        } else {
+          const receivedAt = new Date();
+          em.persist(em.create(InboxMessageRecord, {
+            consumerName: inbox.consumerName,
+            messageId: inbox.messageId,
+            payloadHash: inbox.payloadHash,
+            receivedAt,
+            processedAt: receivedAt,
+          }));
+        }
+      }
         const existing = await em.findOne(WagerTransactionRecord, { idempotencyKey: command.idempotencyKey });
         if (existing) {
           return this.replay(existing, hash);

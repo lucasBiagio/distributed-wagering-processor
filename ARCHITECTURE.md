@@ -113,3 +113,29 @@ CP2B-2 extends the same SQL unit of work to WIN, LOSS, REFUND, and ROLLBACK. The
 For an out-of-order REFUND or ROLLBACK, a supplied-but-unresolved external reference produces `PENDING_REFERENCE`, not a rejection and not a financial movement. The migration adds `reference_attempts` and `reference_next_attempt_at`, constrained to pending-reference rows and indexed by due time. `reprocessPendingReferences` claims due rows with `FOR UPDATE SKIP LOCKED`, making independently running sweeps safe. Retry delays are exponential from 5 seconds and cap at 5 minutes; the record expires at 8 attempts or 24 hours, whichever comes first, as a stable `REFERENCE_NOT_FOUND` rejection. A later resolved sweep routes through the ordinary reversal workflow, preserving the same wallet/ledger/outbox atomicity and replay semantics.
 
 CP2B-2 retains the outbox-only boundary. LocalStack remains a reproducible dependency for readiness and endpoint configuration (`SQS_ENDPOINT=http://localstack:4566` in Compose); no publisher, consumer, acknowledgement flow, or DLQ implementation is added before CP3.
+
+## CP3A FIFO delivery, transactional inbox, and recovery
+
+CP3A introduces `SqsWagerConsumer` as a standalone Nest application context (`scripts/cp3a-sqs-consumer.ts`). It resolves the configured FIFO queue, long-polls with bounded local concurrency, and gives each received delivery to the pre-existing `MikroOrmFinancialProcessing` adapter. It does not create a second financial algorithm and does not publish the outbox.
+
+```text
+SQS FIFO delivery (ReceiptHandle)
+  -> strict WagerTransactionRequested parse
+  -> processWagerWithInbox(command, { consumerName, envelope messageId, payloadHash })
+       -> one PostgreSQL transaction
+            inbox_messages insert/verify
+            wallet lock + existing financial state transition
+            wager_transactions + optional ledger + outbox rows
+       -> COMMIT
+  -> DeleteMessage with the delivery ReceiptHandle
+```
+
+The inbox identity is the application-envelope `messageId`, not SQS's transport `MessageId`: the latter changes on redelivery and is only diagnostic transport metadata. `(consumer_name, message_id)` is checked inside the same SQL transaction as the financial transition. Equal canonical-envelope hashes return the persisted financial result without a new effect; a divergent hash raises an `InboxPayloadConflictError`, produces no movement, and is terminally acknowledged. This is durable cross-process deduplication; no in-memory state participates.
+
+The consumer calls `DeleteMessage` only after `processWagerWithInbox` resolves, which means the SQL transaction has committed. A committed `PROCESSED`, durable `REJECTED`, or `PENDING_REFERENCE` result is acknowledged. A transient failure exits without deletion, so SQS redelivers after visibility timeout. Invalid envelopes likewise remain unacknowledged and rely on the FIFO queue's redrive policy to reach `wager-transactions-dlq.fifo` after the configured receive count. A crash between commit and delete leaves an inbox record and no ACK; a new worker replays it idempotently and then deletes the new delivery receipt.
+
+FIFO `MessageGroupId = walletId` is required for test producers to reduce broker-level same-wallet reordering, but it is not considered financial correctness. PostgreSQL wallet locking, constraints, and the transaction boundary remain the authority under concurrent workers or cross-transport replay.
+
+Shutdown first disables acceptance and aborts the outstanding long poll, then waits for deliveries already in progress. It does not manufacture acknowledgements. Therefore an interrupted pre-commit delivery has no persisted inbox/effect and is safely redelivered; an interrupted post-commit/pre-ACK delivery follows the inbox recovery path.
+
+The CP3A real integration suite uses disposable PostgreSQL databases plus disposable LocalStack FIFO source/DLQ queues. It covers commit/ACK ordering, duplicate delivery, forced pre-commit rollback, insufficient-balance rejection, pending reference sweep, native DLQ redrive, a deterministic crash after commit before ACK across worker processes, three independent worker processes, and HTTP-to-SQS replay. Full outbox publishing, publisher retries, and reconciliation remain reserved for CP3B.

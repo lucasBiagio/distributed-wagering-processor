@@ -44,6 +44,17 @@ export interface ProcessWagerCommand {
   readonly causationId?: string;
 }
 
+/**
+ * Durable identity of a delivery consumed from SQS. `messageId` is the application-envelope
+ * identifier, not SQS's transport `MessageId`, because redelivery receives a new transport
+ * receipt while retaining the same business message identity.
+ */
+export interface InboxMessageCommand {
+  readonly consumerName: string;
+  readonly messageId: string;
+  readonly payloadHash: string;
+}
+
 export interface PendingReferenceSweepOptions {
   /** Injected clock: the sweep never reads the wall clock, which keeps tests deterministic. */
   readonly now: Date;
@@ -98,10 +109,19 @@ export class FinancialNotFoundError extends Error {
   }
 }
 
+/** A duplicate envelope identity carrying different canonical content is terminal. */
+export class InboxPayloadConflictError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'InboxPayloadConflictError';
+  }
+}
+
 export interface FinancialProcessingPort {
   openWallet(command: OpenWalletCommand): Promise<WalletView>;
   processBet(command: ProcessBetCommand): Promise<ProcessWagerResult>;
   processWager(command: ProcessWagerCommand): Promise<ProcessWagerResult>;
+  processWagerWithInbox(command: ProcessWagerCommand, inbox: InboxMessageCommand): Promise<ProcessWagerResult>;
   reprocessPendingReferences(options: PendingReferenceSweepOptions): Promise<PendingReferenceSweepResult>;
   getWallet(walletId: string): Promise<WalletView | null>;
   getTransaction(transactionId: string): Promise<TransactionView | null>;
