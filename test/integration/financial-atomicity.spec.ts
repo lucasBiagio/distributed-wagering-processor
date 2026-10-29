@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { MikroORM } from '@mikro-orm/core';
+import { EntityManager, MikroORM } from '@mikro-orm/core';
 import { PostgreSqlDriver } from '@mikro-orm/postgresql';
 
 import {
@@ -8,6 +8,7 @@ import {
 } from '../../src/infrastructure/persistence/mikro-orm-financial-processing.js';
 import { WagerTransactionStatus } from '../../src/domain/wager-transaction.js';
 import config from '../../src/infrastructure/persistence/mikro-orm.config.js';
+import { declareProcess, renderMetrics } from '../../src/infrastructure/observability/wagering-metrics.js';
 
 interface Fault {
   readonly stage: UnitOfWorkStage;
@@ -40,6 +41,22 @@ class FaultInjectingProcessing extends MikroOrmFinancialProcessing {
   }
 }
 
+class PostgreSqlStateInjectingProcessing extends MikroOrmFinancialProcessing {
+  public state: '40001' | '40P01' | null = null;
+  public remaining = 0;
+  public attempts = 0;
+
+  protected override async interceptUnitOfWork(stage: UnitOfWorkStage, em: EntityManager): Promise<void> {
+    if (stage !== 'before-commit') return;
+    this.attempts += 1;
+    const state = this.state;
+    if (state === null || this.remaining === 0) return;
+    this.remaining -= 1;
+    // PostgreSQL itself emits the SQLSTATE inside the transaction; this is not a synthetic Error.
+    await em.getConnection().execute(`do $$ begin raise sqlstate '${state}' using message = 'controlled CP4 lock conflict'; end $$;`);
+  }
+}
+
 function sqlError(code: string, message: string): Error {
   return Object.assign(new Error(message), { code });
 }
@@ -59,8 +76,8 @@ async function openWallet(balance: string): Promise<{ walletId: string; playerId
   return { walletId: wallet.id, playerId };
 }
 
-function bet(walletId: string, playerId: string, key: string, external: string, amount: string) {
-  return processing.processBet({
+function bet(walletId: string, playerId: string, key: string, external: string, amount: string, adapter: MikroOrmFinancialProcessing = processing) {
+  return adapter.processBet({
     idempotencyKey: key,
     providerId: 'provider-atomicity',
     externalTransactionId: external,
@@ -76,6 +93,12 @@ function bet(walletId: string, playerId: string, key: string, external: string, 
 async function scalar(sql: string): Promise<string> {
   const rows = await orm.em.getConnection().execute(sql) as Array<{ value: string }>;
   return rows[0]!.value;
+}
+
+async function counter(sqlstate: string, resolution: 'retried' | 'exhausted'): Promise<number> {
+  const escaped = `wagering_lock_conflicts_total{sqlstate="${sqlstate}",resolution="${resolution}"}`;
+  const line = (await renderMetrics()).split('\n').find((entry) => entry.startsWith(escaped));
+  return line === undefined ? 0 : Number(line.slice(line.lastIndexOf(' ') + 1));
 }
 
 interface PersistedState {
@@ -105,6 +128,7 @@ async function snapshot(walletId: string): Promise<PersistedState> {
 
 describe('CP2B-1-R1 financial atomicity and transient failure handling', () => {
   beforeAll(async () => {
+    declareProcess('test-harness');
     orm = await MikroORM.init<PostgreSqlDriver>(config);
     await orm.getMigrator().up();
     processing = new FaultInjectingProcessing(orm);
@@ -229,6 +253,38 @@ describe('CP2B-1-R1 financial atomicity and transient failure handling', () => {
       `select count(*)::text as value from wager_transactions where wallet_id = '${walletId}' and status = 'REJECTED'`,
     );
     expect(rejected).toBe('0');
+  });
+
+  test('M5: PostgreSQL SQLSTATE conflicts increment same-process counters and never duplicate financial effects', async () => {
+    const conflicts = new PostgreSqlStateInjectingProcessing(orm);
+    const playerId = uuid(sequence + 600_000);
+    sequence += 1;
+    const wallet = await conflicts.openWallet({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } });
+
+    const retriedBefore = await counter('40P01', 'retried');
+    conflicts.state = '40P01';
+    conflicts.remaining = 1;
+    const retried = await bet(wallet.id, playerId, 'm5-retried', 'm5-retried', '30.00', conflicts);
+    const afterRetry = await snapshot(wallet.id);
+
+    expect(retried.status).toBe(WagerTransactionStatus.Processed);
+    expect(conflicts.attempts).toBe(2);
+    expect(await counter('40P01', 'retried')).toBe(retriedBefore + 1);
+    expect(afterRetry).toMatchObject({ balance: '70.00', transactions: '1', debitEntries: '1', ledgerBalance: '70.00' });
+
+    const exhaustedBefore = await counter('40001', 'exhausted');
+    const beforeExhaustion = await snapshot(wallet.id);
+    conflicts.attempts = 0;
+    conflicts.state = '40001';
+    conflicts.remaining = 10;
+    const exhausted = await bet(wallet.id, playerId, 'm5-exhausted', 'm5-exhausted', '20.00', conflicts)
+      .then(() => null, (error: unknown) => error as Error & { code?: string });
+    const afterExhaustion = await snapshot(wallet.id);
+
+    expect(exhausted?.code).toBe('40001');
+    expect(conflicts.attempts).toBe(3);
+    expect(await counter('40001', 'exhausted')).toBe(exhaustedBefore + 1);
+    expect(afterExhaustion).toEqual(beforeExhaustion);
   });
 
   test('TEST-05: non transient failures are not retried and definitive conflicts stay distinguishable', async () => {

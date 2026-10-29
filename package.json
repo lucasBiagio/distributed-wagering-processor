@@ -9,6 +9,10 @@
   "scripts": {
     "start": "bun run src/main.ts",
     "start:dev": "bun --watch src/main.ts",
+    "migrate": "bun run src/migrate.ts",
+    "sqs-consumer": "bun run src/sqs-consumer.ts",
+    "outbox-publisher": "bun run src/outbox-publisher.ts",
+    "pending-reference-sweeper": "bun run src/pending-reference-sweeper.ts",
     "typecheck": "tsc --noEmit",
     "build": "nest build",
     "test": "bun test test --timeout 60000",

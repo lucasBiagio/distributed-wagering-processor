@@ -5,6 +5,7 @@ import { MikroORM } from '@mikro-orm/core';
 import { PostgreSqlDriver } from '@mikro-orm/postgresql';
 
 import { getAppConfig } from '../config.js';
+import { observeDuration, outboxPublications, retries } from '../observability/wagering-metrics.js';
 
 interface DatabaseOutboxRow {
   readonly id: string;
@@ -158,6 +159,7 @@ export class SqsOutboxPublisher {
             enqueueSequence: candidate.enqueue_sequence,
             leaseExpiresAt: leaseExpiresAt.toISOString(),
           });
+          outboxPublications.inc({ outcome: 'claimed' });
         }
       }
       return claimed;
@@ -178,12 +180,22 @@ export class SqsOutboxPublisher {
         enqueueSequence: message.enqueueSequence,
         attempt: message.attempts + 1,
       });
-      await this.sqs.send(new SendMessageCommand({
-        QueueUrl: this.queueUrl,
-        MessageBody: JSON.stringify(message.payload),
-        MessageGroupId: message.walletId,
-        MessageDeduplicationId: message.id,
-      }));
+      /**
+       * `attempts` is the durable attempt counter of this row, so an attempt after the first
+       * is a genuine retry of the same event. Counting it here — once per real send attempt —
+       * means a lease re-claim cannot inflate the value.
+       */
+      if (message.attempts > 0) {
+        retries.inc({ flow: 'outbox_publisher', reason: 'send_failure' });
+      }
+      await observeDuration('outbox_publish', () => 'accepted', async () => {
+        await this.sqs.send(new SendMessageCommand({
+          QueueUrl: this.queueUrl,
+          MessageBody: JSON.stringify(message.payload),
+          MessageGroupId: message.walletId,
+          MessageDeduplicationId: message.id,
+        }));
+      });
     } catch (error) {
       const nextAttemptAt = await this.scheduleRetry(message, error);
       structuredLog('outbox_publish_failed', {
@@ -192,6 +204,7 @@ export class SqsOutboxPublisher {
         error: error instanceof Error ? error.message : String(error),
         nextAttemptAt: nextAttemptAt?.toISOString() ?? null,
       });
+      outboxPublications.inc({ outcome: 'send_failed' });
       return { confirmed: 0, failed: 1 };
     }
 
@@ -203,10 +216,12 @@ export class SqsOutboxPublisher {
       const confirmed = await this.confirm(message);
       if (confirmed) {
         structuredLog('outbox_published', { eventId: message.id, walletId: message.walletId });
+        outboxPublications.inc({ outcome: 'published' });
         return { confirmed: 1, failed: 0 };
       }
 
       structuredLog('outbox_confirmation_stale', { eventId: message.id, walletId: message.walletId });
+      outboxPublications.inc({ outcome: 'confirmation_stale' });
       return { confirmed: 0, failed: 0 };
     } catch (error) {
       // Database failure after SQS acceptance is intentionally not converted into success or a destructive retry.
@@ -216,6 +231,7 @@ export class SqsOutboxPublisher {
         walletId: message.walletId,
         error: error instanceof Error ? error.message : String(error),
       });
+      outboxPublications.inc({ outcome: 'confirmation_error' });
       throw error;
     }
   }

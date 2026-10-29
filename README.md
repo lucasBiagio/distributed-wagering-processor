@@ -1,8 +1,8 @@
 # Distributed Wagering Processor
 
-CP2A delivers the framework-free financial domain and its PostgreSQL persistence boundary for the Jungle Gaming challenge. The full assignment remains unchanged in [CHALLENGE.md](./CHALLENGE.md).
+This repository implements the financial processing, HTTP API, PostgreSQL ledger, SQS inbox/outbox delivery, operational pending-reference sweep, and reconciliation workflow required by the Jungle Gaming challenge. The full assignment remains unchanged in [CHALLENGE.md](./CHALLENGE.md).
 
-> **Scope:** CP2A does not implement financial HTTP endpoints, transaction-processing use cases, SQS consumers/workers, outbox publication, reconciliation, or the CP2B concurrency workflow. Existing health endpoints remain the CP1 operational surface.
+> **Scope:** Authentication is intentionally not implemented because it is optional for this challenge. An API gateway or NestJS guard can be introduced at the HTTP boundary without changing financial contracts or persisted effects.
 
 ## Stack
 
@@ -62,7 +62,23 @@ curl http://localhost:3000/health/live
 curl http://localhost:3000/health/ready
 ```
 
-The Compose stack starts PostgreSQL, LocalStack SQS, and NestJS. `/health/live` only checks process liveness. `/health/ready` performs a real PostgreSQL `SELECT 1` through MikroORM and a real SQS `ListQueues`; it returns HTTP 503 if either dependency fails.
+The Compose stack starts PostgreSQL, LocalStack SQS, a one-shot `migrate` job, NestJS and the three workers (`sqs-consumer`, `outbox-publisher`, `pending-reference-sweeper`). `/health/live` only checks process liveness. `/health/ready` performs a real PostgreSQL `SELECT 1` through MikroORM and a real SQS `ListQueues`; it returns HTTP 503 if either dependency fails.
+
+### Production runtime: one image, five compiled entrypoints
+
+Every runtime process is a file under `src/` compiled by `nest build`, so the production image (which ships only `dist` and `node_modules` — no sources, no `package.json`) runs the same typechecked artifacts the suites exercise:
+
+| Process | Development | Production image |
+| --- | --- | --- |
+| HTTP API | `bun run start` | `bun run dist/main.js` |
+| Schema migrations | `bun run migrate` | `bun run dist/migrate.js` |
+| SQS wager consumer | `bun run sqs-consumer` | `bun run dist/sqs-consumer.js` |
+| Outbox publisher | `bun run outbox-publisher` | `bun run dist/outbox-publisher.js` |
+| Pending-reference sweeper | `bun run pending-reference-sweeper` | `bun run dist/pending-reference-sweeper.js` |
+
+`scripts/cp3a-sqs-consumer.ts` and `scripts/cp3b-outbox-publisher.ts` remain as thin wrappers that import `src/sqs-consumer.ts` and `src/outbox-publisher.ts`, so the existing integration suites keep spawning those paths while there is exactly one functional implementation of each worker. `scripts/cp2b1-process-worker.ts` stays a test-only concurrency helper and is deliberately not a production service.
+
+`dist/migrate.js` applies pending migrations and nothing else: it never runs `down`, it fails explicitly when its migration directory ships no migration file or when migrations remain pending afterwards, and re-running it on an up-to-date database applies nothing and exits `0`. Compose runs it as a job and gates the API and every worker behind `service_completed_successfully`, so no process touches data before the schema is in place. Ports are configurable (`POSTGRES_PORT`, `LOCALSTACK_PORT`, `APP_PORT`) to keep disposable stacks from colliding.
 
 ## Quality, migrations, and isolated PostgreSQL integration tests
 
@@ -181,7 +197,9 @@ Run the CP2B-2 gates against disposable PostgreSQL and LocalStack services. `doc
 CP3A adds the `WagerTransactionRequested` FIFO consumer only; it deliberately does **not** publish the outbox. Start the worker as a separate process after the Compose dependencies are healthy:
 
 ```bash
-bun run scripts/cp3a-sqs-consumer.ts
+bun run sqs-consumer                 # development: src/sqs-consumer.ts
+bun run dist/sqs-consumer.js         # container: emitted by `nest build`
+bun run scripts/cp3a-sqs-consumer.ts # legacy wrapper kept for the existing suites
 ```
 
 The worker uses `wager-transactions.fifo` by default. Configure `WAGER_TRANSACTIONS_QUEUE_URL` for an isolated queue (the preferred integration-test path), or `WAGER_TRANSACTIONS_QUEUE_NAME` to resolve a named queue. `SQS_CONSUMER_CONCURRENCY` defaults to `4`; `SQS_CONSUMER_VISIBILITY_TIMEOUT_SECONDS` defaults to `5`. The worker long-polls SQS and uses each delivery's current `ReceiptHandle` for deletion.
@@ -228,7 +246,9 @@ bun run test
 CP3B publishes the financial outbox to the FIFO queue `wager-events.fifo`. Start it as a separate process only after PostgreSQL and SQS are healthy:
 
 ```bash
-bun run scripts/cp3b-outbox-publisher.ts
+bun run outbox-publisher                 # development: src/outbox-publisher.ts
+bun run dist/outbox-publisher.js         # container: emitted by `nest build`
+bun scripts/cp3b-outbox-publisher.ts     # legacy wrapper kept for the existing suites
 ```
 
 The default mode is continuous: an empty outbox is temporary, so the process waits and continues claiming when a later committed event becomes eligible. `SIGINT` and `SIGTERM` stop new claims, allow work already claimed to finish its current controlled path, then close SQS and MikroORM resources. For a bounded batch/CI invocation, set `OUTBOX_PUBLISHER_STOP_WHEN_IDLE=true`; it exits only after no eligible row remains and no currently claimed batch is still being processed.
@@ -260,3 +280,78 @@ bun run test
 ```
 
 The CP3B integration suite uses real PostgreSQL and LocalStack for committed-row publication, pre-commit exclusion, concurrent publishers, crash recovery before and after SQS acceptance, persisted retry, wallet ordering, restart recovery, exact envelope preservation, and durable downstream `eventId` deduplication. Migration reversibility (`UP → DOWN → UP`) must likewise be checked only on a disposable database; never run migration down against a development or production database.
+
+## CP4 ledger, reconciliation, and pending-reference sweep
+
+`GET /wallets/:walletId/ledger?limit=50&cursor=...` reads only persisted `wallet_ledger_entries`. It orders ascending by `(created_at, id)` and uses an opaque base64url cursor containing version `1`, wallet identity, and the last keyset position. A cursor for a different wallet or a malformed cursor returns `400`; a missing wallet returns `404`. `limit` defaults to `50` and must be an integer from `1` to `100`. Monetary fields are decimal strings.
+
+Pagination is forward keyset pagination, not a multi-request snapshot: rows committed after a page can appear in a later page only if their `(created_at, id)` sorts after the cursor. Rows before or equal to the cursor are never repeated. Consumers requiring a snapshot must retain their own upper-bound cursor or query a stable reporting replica.
+
+`POST /wallets/:walletId/reconciliation` locks the wallet for a consistent read and reconstructs its balance from persisted ledger rows (`CREDIT` adds and `DEBIT` subtracts) with PostgreSQL `numeric` and `decimal.js`. It returns stored/calculated balances and signed difference as two-decimal strings. It never repairs a divergence; it emits a structured `wallet_reconciliation_inconsistent` log for operational alerting.
+
+Start the pending-reference runner separately — from sources in development, or from the compiled artifact the production image ships:
+
+```bash
+bun run pending-reference-sweeper      # development: src/pending-reference-sweeper.ts
+bun run dist/pending-reference-sweeper.js   # container: emitted by `nest build`
+```
+
+It invokes the existing durable `reprocessPendingReferences` algorithm at `PENDING_REFERENCE_SWEEP_INTERVAL_MS` (default `5000`) in batches controlled by `PENDING_REFERENCE_SWEEP_BATCH_SIZE` (default `50`). Its in-process overlap guard prevents local overlap; `FOR UPDATE SKIP LOCKED` in the existing persistence algorithm makes multiple runner processes safe. The Docker Compose service `pending-reference-sweeper` runs it from the same production image as the API. SIGINT/SIGTERM prevents the next batch and closes the database connection after the active batch completes; the runner logs `pending_reference_sweeper_started`, `pending_reference_sweep_completed`, `pending_reference_sweeper_stopping` and `pending_reference_sweeper_stopped` as structured JSON lines.
+
+## CP4 distributed Prometheus observability
+
+`GET /metrics` on the API returns Prometheus text format `0.0.4`. It is an operational endpoint, not a public provider API: keep it behind the internal network, gateway policy, or scraper allowlist. It never includes credentials, monetary values, payload bodies, or identifier-valued labels.
+
+Every worker has an independent optional metrics listener. Set `WORKER_METRICS_PORT` when starting a single worker; the listener provides `GET /metrics` and `GET /health/live`. In Compose the listeners are internal-only (no host `ports` mapping): `sqs-consumer:9465`, `outbox-publisher:9466`, and `pending-reference-sweeper:9467`. The API remains `app:3000/metrics`. Scrape these targets from a monitoring process on the Compose network; do not expose them indiscriminately on a public ingress.
+
+| Family | Metric(s) | Source and scope |
+| --- | --- | --- |
+| transaction status/failure | `wagering_transactions_state`, `wagering_transaction_failures_state` | read-only PostgreSQL aggregates (`global_postgresql`) |
+| idempotency and outcomes | `wagering_duplicate_submissions_total`, `wagering_wager_outcomes_total` | process-local counters |
+| retries and SQL conflicts | `wagering_retries_total`, `wagering_lock_conflicts_total` | process-local counters; reasons are bounded (`40001`, `40P01`, flow names) |
+| outbox | `wagering_outbox_messages_state`, `wagering_outbox_lag_seconds` | read-only PostgreSQL aggregates (`global_postgresql`) |
+| SQS/DLQ | `wagering_sqs_queue_messages_approximate`, `wagering_dlq_messages_approximate` | SQS queue attributes (`approximate_sqs`); values are approximate by broker contract |
+| latency | `wagering_processing_duration_seconds` | process-local seconds histogram with cumulative buckets, `_sum`, and `_count` |
+| reconciliation | `wagering_reconciliation_divergent_wallets_state`, `wagering_reconciliation_checks_total` | PostgreSQL aggregate plus process-local result counter |
+
+`process_local` counters and histograms belong only to the process that handled work; aggregate those series in Prometheus, never by making the API pretend to be a global worker view. `global_postgresql` gauges are recomputed read-only on each scraper target and must not be summed across targets. `approximate_sqs` series report SQS `Approximate*` attributes and may lag broker reality. The pending-reference sweeper intentionally has no SQS/DLQ collector because it does not consume a queue.
+
+If the SQS collector is unavailable, the API continues exposing PostgreSQL and process-local series and increments `wagering_metrics_collection_errors_total{collector="sqs"}`. A collection failure is not reported as a healthy zero queue depth. Worker listener startup fails before the worker begins processing if its configured port cannot bind; absence of `WORKER_METRICS_PORT` keeps the listener disabled.
+
+Example local inspection (use a disposable environment and an internal address):
+
+```bash
+curl http://127.0.0.1:3000/metrics
+curl http://sqs-consumer:9465/health/live
+curl http://outbox-publisher:9466/metrics
+curl http://pending-reference-sweeper:9467/metrics
+```
+
+For a focused observability gate, run `bun test test/integration/observability-metrics.spec.ts` and `bun test test/integration/worker-metrics-server.spec.ts` after `bun run build`; all financial and SQS integration tests still require isolated PostgreSQL and LocalStack.
+
+### CP4 closure: causal metric evidence M1-M8
+
+Every metric family above is closed by a test that proves *causality* — a real operation is executed and the exposition is compared before and after — never by asserting that a series merely exists:
+
+| Evidence | Test | What the real operation is |
+| --- | --- | --- |
+| M1 | `test/integration/cp4-r3b1-causal-metrics.spec.ts` | BET/WIN/REFUND plus a durable `INSUFFICIENT_BALANCE` rejection move the PostgreSQL status/failure gauges with no extra financial movement |
+| M2 | same file | idempotent replay and payload conflict move only the API-local duplicate counters and create no ledger or outbox row |
+| M3 | same file | a real SQS failure, a persisted retry and a successful publication bracket the publisher counters and drive `wagering_outbox_lag_seconds` positive then back to `0` |
+| M4 | same file | a real FIFO redelivery advances `ApproximateReceiveCount`, moves the consumer-local retry counter and the DLQ gauge read from `GetQueueAttributes` |
+| M5 | `test/integration/financial-atomicity.spec.ts` | PostgreSQL raises real `40001`/`40P01`; `wagering_lock_conflicts_total` separates `retried` from `exhausted` in the same process and no financial effect is duplicated |
+| M6 | `test/integration/cp4-r3b1-causal-metrics.spec.ts` | one real wager adds exactly one `wagering_processing_duration_seconds` sample; buckets stay cumulative, `le="+Inf"` equals `_count`, and the value is seconds bounded by the HTTP round trip |
+| M7 | same file | a controlled divergence injected only in the disposable database is reported by `POST /wallets/:id/reconciliation` and by `wagering_reconciliation_divergent_wallets_state`, is never repaired automatically, and is restored only by the test's own mechanism |
+| M8 | same file | the network path to real LocalStack is cut for one API process: `wagering_metrics_collection_errors_total{collector="sqs"}` grows, the `approximate_sqs` series are absent instead of a fabricated zero, the PostgreSQL scope keeps answering, and restoring connectivity brings the real queue depth back and freezes the error counter |
+
+Run the whole closure with `bun run test` (the suite discovers M1-M8 automatically) against the Compose `postgres` and `localstack` services. M8 needs no privileged Docker access: it proxies the real SQS endpoint and closes that proxy, so the outage and the recovery are real network events against real LocalStack.
+
+Migration reversibility is checked as `UP → DOWN → UP` **only** on a throwaway database, never against development or production data:
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d postgres -c 'create database cp4_migration_probe'
+DATABASE_URL=postgresql://.../cp4_migration_probe bun run src/migrate.ts   # UP, DOWN to 0, UP again
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d postgres -c 'drop database cp4_migration_probe'
+```
+
+Do not use the MikroORM schema generator (`schema:update`/`getUpdateSchemaSQL`) on this project. The durable guarantees live in hand-written SQL that entity metadata cannot express — check constraints, partial and expression indexes, composite identity foreign keys and the immutability/version triggers — so the generator proposes dropping them. Migrations are the only supported path for schema change.

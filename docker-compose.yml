@@ -31,11 +31,41 @@ services:
       retries: 30
       start_period: 15s
 
+  pending-reference-sweeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-wagering-processor:local
+    # The production image ships the compiled runner emitted by `nest build`, exactly like
+    # the API entrypoint; no sources or package.json are needed at runtime.
+    command: ["bun", "run", "dist/pending-reference-sweeper.js"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wagering}:${POSTGRES_PASSWORD:-wagering}@postgres:5432/${POSTGRES_DB:-wagering}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SQS_ENDPOINT: http://localstack:4566
+      PENDING_REFERENCE_SWEEP_INTERVAL_MS: ${PENDING_REFERENCE_SWEEP_INTERVAL_MS:-5000}
+      PENDING_REFERENCE_SWEEP_BATCH_SIZE: ${PENDING_REFERENCE_SWEEP_BATCH_SIZE:-50}
+      WORKER_METRICS_PORT: 9467
+    expose:
+      - "9467"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const response = await fetch('http://localhost:9467/health/live'); process.exit(response.ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
+    image: distributed-wagering-processor:local
+    environment: &app-environment
       PORT: 3000
       DATABASE_URL: postgresql://${POSTGRES_USER:-wagering}:${POSTGRES_PASSWORD:-wagering}@postgres:5432/${POSTGRES_DB:-wagering}
       AWS_REGION: ${AWS_REGION:-us-east-1}
@@ -49,9 +79,78 @@ services:
         condition: service_healthy
       localstack:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "bun", "-e", "const response = await fetch('http://localhost:3000/health/live'); process.exit(response.ok ? 0 : 1)"]
       interval: 5s
       timeout: 3s
       retries: 20
       start_period: 5s
+
+  # One-shot schema job. Every service that touches data waits for it to exit 0, so the API and the
+  # workers never start processing against a missing or outdated schema. It runs the compiled
+  # `dist/migrate.js` from the very same production image, so no source mount, no host Bun and no
+  # MikroORM CLI are required. `down` is never executed here.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-wagering-processor:local
+    command: ["bun", "run", "dist/migrate.js"]
+    environment:
+      <<: *app-environment
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sqs-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-wagering-processor:local
+    command: ["bun", "run", "dist/sqs-consumer.js"]
+    environment:
+      <<: *app-environment
+      WORKER_METRICS_PORT: 9465
+    expose:
+      - "9465"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const response = await fetch('http://localhost:9465/health/live'); process.exit(response.ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  outbox-publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-wagering-processor:local
+    command: ["bun", "run", "dist/outbox-publisher.js"]
+    environment:
+      <<: *app-environment
+      WORKER_METRICS_PORT: 9466
+    expose:
+      - "9466"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const response = await fetch('http://localhost:9466/health/live'); process.exit(response.ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully

@@ -21,6 +21,7 @@ import { DomainRuleError } from '../../domain/domain-error.js';
 import { MoneyValidationError } from '../../domain/money.js';
 import { canonicalJson } from '../persistence/mikro-orm-financial-processing.js';
 import { getAppConfig } from '../config.js';
+import { observeDuration, retries, sqsDeliveries } from '../observability/wagering-metrics.js';
 import { MikroOrmFinancialProcessing } from '../persistence/mikro-orm-financial-processing.js';
 import { SQS_CLIENT } from './sqs.module.js';
 
@@ -175,6 +176,9 @@ export class SqsWagerConsumer implements OnApplicationShutdown {
           WaitTimeSeconds: 20,
           VisibilityTimeout: config.sqsConsumerVisibilityTimeoutSeconds,
           MessageAttributeNames: ['All'],
+          // Needed to tell a first delivery from a redelivery, which is the only honest
+          // source for "retries" on the consumer side.
+          MessageSystemAttributeNames: ['ApproximateReceiveCount'],
         }), { abortSignal: this.pollAbortController.signal });
       } catch (error) {
         if (!this.accepting && error instanceof Error && error.name === 'AbortError') {
@@ -226,7 +230,18 @@ export class SqsWagerConsumer implements OnApplicationShutdown {
   ): Promise<boolean> {
     if (!message.Body || !message.ReceiptHandle) {
       structuredLog('sqs_delivery_invalid_transport', { sqsMessageId: message.MessageId });
+      sqsDeliveries.inc({ outcome: 'invalid_transport' });
       return false;
+    }
+
+    /**
+     * A redelivery is a real retry of the same logical work, and SQS counts it for us. The
+     * counter is incremented once per delivery that SQS reports as a repeat, never once per
+     * re-read of durable state, so the value cannot be inflated by inbox lookups.
+     */
+    const receiveCount = Number.parseInt(message.Attributes?.ApproximateReceiveCount ?? '1', 10);
+    if (Number.isFinite(receiveCount) && receiveCount > 1) {
+      retries.inc({ flow: 'sqs_consumer', reason: 'redelivery' });
     }
 
     let envelope: WagerTransactionRequestedEnvelope;
@@ -234,6 +249,7 @@ export class SqsWagerConsumer implements OnApplicationShutdown {
       envelope = parseEnvelope(message.Body);
     } catch (error) {
       structuredLog('sqs_delivery_permanent_invalid', { sqsMessageId: message.MessageId });
+      sqsDeliveries.inc({ outcome: 'permanent_invalid' });
       return false;
     }
 
@@ -244,11 +260,15 @@ export class SqsWagerConsumer implements OnApplicationShutdown {
     });
 
     try {
-      const result = await this.processing.processWagerWithInbox(envelope.data, {
-        consumerName: WAGER_TRANSACTION_CONSUMER_NAME,
-        messageId: envelope.messageId,
-        payloadHash: envelopeHash(envelope),
-      });
+      const result = await observeDuration(
+        'sqs_delivery',
+        () => 'committed',
+        () => this.processing.processWagerWithInbox(envelope.data, {
+          consumerName: WAGER_TRANSACTION_CONSUMER_NAME,
+          messageId: envelope.messageId,
+          payloadHash: envelopeHash(envelope),
+        }),
+      );
       structuredLog('sqs_delivery_committed', {
         messageId: envelope.messageId,
         transactionId: result.transactionId,
@@ -262,6 +282,7 @@ export class SqsWagerConsumer implements OnApplicationShutdown {
         messageId: envelope.messageId,
         transactionId: result.transactionId,
       });
+      sqsDeliveries.inc({ outcome: 'acknowledged' });
       return true;
     } catch (error) {
       if (error instanceof InboxPayloadConflictError) {
@@ -271,14 +292,17 @@ export class SqsWagerConsumer implements OnApplicationShutdown {
           messageId: envelope.messageId,
           reason: 'inbox_payload_conflict',
         });
+        sqsDeliveries.inc({ outcome: 'inbox_payload_conflict' });
         return false;
       }
       if (permanentError(error)) {
         // Leave the message unacknowledged: SQS redrive policy owns bounded retries and DLQ.
         structuredLog('sqs_delivery_permanent_invalid', { messageId: envelope.messageId });
+        sqsDeliveries.inc({ outcome: 'permanent_invalid' });
         return false;
       }
       structuredLog('sqs_delivery_transient_failure', { messageId: envelope.messageId });
+      sqsDeliveries.inc({ outcome: 'transient_failure' });
       return false;
     }
   }

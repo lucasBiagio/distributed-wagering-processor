@@ -3,12 +3,16 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { LockMode, type EntityManager, MikroORM } from '@mikro-orm/core';
 
+import { Decimal } from 'decimal.js';
+
 import {
   FinancialConflictError,
   FinancialNotFoundError,
   InboxPayloadConflictError,
+  InvalidLedgerCursorError,
   type FinancialProcessingPort,
   type InboxMessageCommand,
+  type LedgerEntryView,
   type OpenWalletCommand,
   type PendingReferenceSweepOptions,
   type PendingReferenceSweepResult,
@@ -16,6 +20,8 @@ import {
   type ProcessWagerCommand,
   type ProcessWagerResult,
   type TransactionView,
+  type WalletLedgerPage,
+  type WalletReconciliation,
   type WagerKindInput,
   type WalletView,
 } from '../../application/financial-contracts.js';
@@ -27,6 +33,16 @@ import {
   WagerTransactionProcessed,
   WagerTransactionRejected,
 } from '../../application/integration-events.js';
+import {
+  duplicateSubmissions,
+  lockConflicts,
+  observeDuration,
+  pendingReferenceSweeps,
+  reconciliationChecks,
+  retries,
+  wagerOutcomes,
+} from '../observability/wagering-metrics.js';
+import { sqlState, transientConflict } from './transient-errors.js';
 import { DomainRuleError } from '../../domain/domain-error.js';
 import { Money, type MoneyProps } from '../../domain/money.js';
 import { Wallet } from '../../domain/wallet.js';
@@ -90,17 +106,6 @@ function assertUuid(value: string, name: string): void {
   }
 }
 
-function sqlState(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null) {
-    return undefined;
-  }
-  const candidate = error as { code?: unknown; cause?: { code?: unknown } };
-  if (typeof candidate.code === 'string') {
-    return candidate.code;
-  }
-  return typeof candidate.cause?.code === 'string' ? candidate.cause.code : undefined;
-}
-
 function uniqueViolation(error: unknown): boolean {
   return sqlState(error) === '23505';
 }
@@ -120,9 +125,10 @@ function constraintName(error: unknown): string | undefined {
  * PostgreSQL deadlock (40P01) and serialization failure (40001) are transient: the whole
  * unit of work is rolled back by PostgreSQL and no external effect has been produced, so a
  * bounded retry of the complete transaction cannot duplicate a debit. Definitive business
- * or uniqueness violations are never retried.
+ * or uniqueness violations are never retried. The classification itself lives in
+ * `transient-errors.ts` because the HTTP layer needs exactly the same definition to decide
+ * between 503 and 500.
  */
-const TRANSIENT_SQLSTATES = new Set(['40001', '40P01']);
 const MAX_BET_ATTEMPTS = 3;
 
 /**
@@ -180,9 +186,24 @@ type ReferenceResolution =
 
 type PendingResolutionOutcome = 'processed' | 'rejected' | 'rescheduled' | 'skipped';
 
-function transientConflict(error: unknown): boolean {
-  const state = sqlState(error);
-  return state !== undefined && TRANSIENT_SQLSTATES.has(state);
+/**
+ * Metric outcome label for a wager result. Bounded set of lowercase words derived from the
+ * persisted status — never from the amount, the wallet or any identifier.
+ */
+function wagerOutcomeLabel(result: ProcessWagerResult): string {
+  if (result.idempotentReplay) {
+    return 'idempotent_replay';
+  }
+  switch (result.status) {
+    case WagerTransactionStatus.Processed:
+      return 'processed';
+    case WagerTransactionStatus.Rejected:
+      return 'rejected';
+    case WagerTransactionStatus.PendingReference:
+      return 'pending_reference';
+    default:
+      return 'pending';
+  }
 }
 
 /**
@@ -361,13 +382,45 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
     command: ProcessWagerCommand,
     inbox?: InboxMessageCommand,
   ): Promise<ProcessWagerResult> {
+    return this.processWagerInstrumented(command, inbox ? 'sqs' : 'http', inbox);
+  }
+
+  /**
+   * `source` identifies the entry point for the process-local metrics only; it has no effect
+   * on the financial unit of work, which is byte-for-byte the same for HTTP and SQS.
+   *
+   * Instrumentation contract:
+   * - one duration observation per *real* attempt of the unit of work (a retry adds its own
+   *   observation, a durable-state re-read does not);
+   * - one outcome increment per returned result, recorded where the result is produced, so a
+   *   nested replay is never counted twice;
+   * - a payload conflict is counted as a conflict, never as a replay.
+   */
+  private async processWagerInstrumented(
+    command: ProcessWagerCommand,
+    source: 'http' | 'sqs',
+    inbox?: InboxMessageCommand,
+  ): Promise<ProcessWagerResult> {
     this.validateWager(command);
     const hash = payloadHash(command);
 
     for (let attempt = 1; ; attempt += 1) {
       try {
-        return await this.runWagerUnitOfWork(command, hash, inbox);
+        const result = await observeDuration(
+          'process_wager',
+          (value: ProcessWagerResult) => wagerOutcomeLabel(value),
+          () => this.runWagerUnitOfWork(command, hash, inbox),
+        );
+        return this.recordWagerOutcome(source, result);
       } catch (error) {
+        if (error instanceof InboxPayloadConflictError) {
+          duplicateSubmissions.inc({ source, outcome: 'inbox_payload_conflict' });
+          throw error;
+        }
+        if (error instanceof FinancialConflictError) {
+          duplicateSubmissions.inc({ source, outcome: 'payload_conflict' });
+          throw error;
+        }
         if (uniqueViolation(error)) {
           if (inbox) {
             const duplicate = await this.orm.em.fork().findOne(InboxMessageRecord, {
@@ -376,19 +429,48 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
             });
             if (duplicate) {
               if (duplicate.payloadHash !== inbox.payloadHash) {
+                duplicateSubmissions.inc({ source, outcome: 'inbox_payload_conflict' });
                 throw new InboxPayloadConflictError('Inbox messageId was already used with a different payload');
               }
-              return this.processWager(command);
+              duplicateSubmissions.inc({ source, outcome: 'inbox_replay' });
+              // The nested call records the outcome of the result it returns.
+              return await this.processWagerInstrumented(command, source);
             }
           }
-          return await this.resolveUniqueViolation(command, hash, error);
+          try {
+            // A durable-state lookup, not a new unit of work: no duration is observed here.
+            return this.recordWagerOutcome(source, await this.resolveUniqueViolation(command, hash, error));
+          } catch (resolutionError) {
+            if (resolutionError instanceof FinancialConflictError) {
+              duplicateSubmissions.inc({ source, outcome: 'payload_conflict' });
+            }
+            throw resolutionError;
+          }
         }
-        if (transientConflict(error) && attempt < MAX_BET_ATTEMPTS) {
-          continue;
+        if (transientConflict(error)) {
+          const state = sqlState(error) ?? 'unknown';
+          if (attempt < MAX_BET_ATTEMPTS) {
+            lockConflicts.inc({ sqlstate: state, resolution: 'retried' });
+            retries.inc({
+              flow: 'financial_unit_of_work',
+              reason: state === '40P01' ? 'deadlock' : 'serialization_failure',
+            });
+            continue;
+          }
+          lockConflicts.inc({ sqlstate: state, resolution: 'exhausted' });
         }
         throw error;
       }
     }
+  }
+
+  private recordWagerOutcome(source: 'http' | 'sqs', result: ProcessWagerResult): ProcessWagerResult {
+    const outcome = wagerOutcomeLabel(result);
+    wagerOutcomes.inc({ source, outcome });
+    if (result.idempotentReplay) {
+      duplicateSubmissions.inc({ source, outcome: 'idempotent_replay' });
+    }
+    return result;
   }
 
   private async runWagerUnitOfWork(
@@ -561,7 +643,12 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
     let rescheduled = 0;
 
     for (const candidate of due) {
-      const outcome = await this.resolvePendingReference(candidate.id, options.now);
+      const outcome = await observeDuration(
+        'pending_reference_resolution',
+        (value: PendingResolutionOutcome) => value,
+        () => this.resolvePendingReference(candidate.id, options.now),
+      );
+      pendingReferenceSweeps.inc({ outcome });
       if (outcome === 'skipped') {
         continue;
       }
@@ -571,6 +658,12 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
       } else if (outcome === 'rejected') {
         rejected += 1;
       } else {
+        /**
+         * A reschedule is a real additional attempt against the same pending row, so it is
+         * counted as a retry exactly once per sweep pass. A row merely re-read and skipped
+         * (claimed by another sweeper) is not a retry and is not counted as one.
+         */
+        retries.inc({ flow: 'pending_reference_sweep', reason: 'reference_unresolved' });
         rescheduled += 1;
       }
     }
@@ -819,6 +912,96 @@ export class MikroOrmFinancialProcessing implements FinancialProcessingPort {
       throw new FinancialConflictError('The referenced transaction was already reversed');
     }
     throw error;
+  }
+
+  public async getWalletLedger(walletId: string, cursor: string | undefined, limit: number): Promise<WalletLedgerPage> {
+    if (!isUuid(walletId) || !await this.orm.em.fork().findOne(WalletRecord, walletId)) {
+      throw new FinancialNotFoundError(`Wallet ${walletId} does not exist`);
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new InvalidLedgerCursorError('limit must be an integer between 1 and 100');
+    }
+
+    const position = cursor === undefined ? undefined : this.decodeLedgerCursor(cursor, walletId);
+    const rows = await this.orm.em.getConnection().execute(
+      `select l.id::text as id, l.transaction_id::text as transaction_id, t.kind, l.direction,
+              l.amount::text as amount, l.currency, l.balance_before::text as balance_before,
+              l.balance_after::text as balance_after, l.created_at
+         from wallet_ledger_entries l
+         join wager_transactions t on t.id = l.transaction_id
+        where l.wallet_id = ?
+          and (?::timestamptz is null or (l.created_at, l.id) > (?::timestamptz, ?::uuid))
+        order by l.created_at asc, l.id asc
+        limit ?`,
+      [walletId, position?.createdAt ?? null, position?.createdAt ?? null, position?.id ?? null, limit + 1],
+    ) as Array<{ id: string; transaction_id: string; kind: string; direction: string; amount: string; currency: string; balance_before: string; balance_after: string; created_at: Date }>;
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+    const entries: LedgerEntryView[] = page.map((row) => ({
+      id: row.id,
+      transactionId: row.transaction_id,
+      kind: row.kind,
+      direction: row.direction,
+      money: { amount: new Decimal(row.amount).toFixed(2), currency: row.currency },
+      balanceBefore: new Decimal(row.balance_before).toFixed(2),
+      balanceAfter: new Decimal(row.balance_after).toFixed(2),
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
+    const final = page.at(-1);
+    return {
+      walletId,
+      entries,
+      hasMore,
+      nextCursor: hasMore && final ? this.encodeLedgerCursor(walletId, new Date(final.created_at).toISOString(), final.id) : null,
+    };
+  }
+
+  public async reconcileWallet(walletId: string): Promise<WalletReconciliation> {
+    if (!isUuid(walletId)) {
+      throw new FinancialNotFoundError(`Wallet ${walletId} does not exist`);
+    }
+    return await this.orm.em.transactional(async (em) => {
+      const wallet = await em.findOne(WalletRecord, walletId, { lockMode: LockMode.PESSIMISTIC_READ });
+      if (!wallet) {
+        throw new FinancialNotFoundError(`Wallet ${walletId} does not exist`);
+      }
+      const reconciliationRows = await em.getConnection().execute(
+        `select coalesce(sum(case when direction = 'CREDIT' then amount else -amount end), 0)::text as calculated_balance,
+                count(*)::text as checked_entries
+           from wallet_ledger_entries
+          where wallet_id = ?`,
+        [walletId],
+      ) as Array<{ calculated_balance: string; checked_entries: string }>;
+      const row = reconciliationRows[0];
+      if (!row) {
+        throw new Error('Reconciliation aggregate query returned no row');
+      }
+      const storedBalance = new Decimal(wallet.balance).toFixed(2);
+      const calculatedBalance = new Decimal(row.calculated_balance).toFixed(2);
+      const difference = new Decimal(storedBalance).minus(calculatedBalance).toFixed(2);
+      const consistent = new Decimal(difference).isZero();
+      reconciliationChecks.inc({ result: consistent ? 'consistent' : 'inconsistent' });
+      if (!consistent) {
+        process.stdout.write(`${JSON.stringify({ event: 'wallet_reconciliation_inconsistent', walletId, storedBalance, calculatedBalance, difference })}\n`);
+      }
+      return { walletId, storedBalance, calculatedBalance, difference, consistent, checkedEntries: Number(row.checked_entries) };
+    });
+  }
+
+  private encodeLedgerCursor(walletId: string, createdAt: string, id: string): string {
+    return Buffer.from(JSON.stringify({ v: 1, walletId, createdAt, id }), 'utf8').toString('base64url');
+  }
+
+  private decodeLedgerCursor(cursor: string, walletId: string): { createdAt: string; id: string } {
+    try {
+      const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Record<string, unknown>;
+      if (value.v !== 1 || value.walletId !== walletId || typeof value.createdAt !== 'string' || !isUuid(String(value.id)) || Number.isNaN(Date.parse(value.createdAt))) {
+        throw new Error('invalid cursor payload');
+      }
+      return { createdAt: value.createdAt, id: String(value.id) };
+    } catch {
+      throw new InvalidLedgerCursorError('cursor is invalid or belongs to a different wallet');
+    }
   }
 
   public async getWallet(walletId: string): Promise<WalletView | null> {

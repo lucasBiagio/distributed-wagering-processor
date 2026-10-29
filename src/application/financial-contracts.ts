@@ -75,6 +75,40 @@ export interface WalletView {
   readonly version: number;
 }
 
+export interface LedgerEntryView {
+  readonly id: string;
+  readonly transactionId: string;
+  readonly kind: string;
+  readonly direction: string;
+  readonly money: MoneyProps;
+  readonly balanceBefore: string;
+  readonly balanceAfter: string;
+  readonly createdAt: string;
+}
+
+export interface WalletLedgerPage {
+  readonly walletId: string;
+  readonly entries: readonly LedgerEntryView[];
+  readonly nextCursor: string | null;
+  readonly hasMore: boolean;
+}
+
+export interface WalletReconciliation {
+  readonly walletId: string;
+  readonly storedBalance: string;
+  readonly calculatedBalance: string;
+  readonly difference: string;
+  readonly consistent: boolean;
+  readonly checkedEntries: number;
+}
+
+export class InvalidLedgerCursorError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'InvalidLedgerCursorError';
+  }
+}
+
 export interface TransactionView {
   readonly transactionId: string;
   readonly providerId: string;
@@ -123,6 +157,8 @@ export interface FinancialProcessingPort {
   processWager(command: ProcessWagerCommand): Promise<ProcessWagerResult>;
   processWagerWithInbox(command: ProcessWagerCommand, inbox: InboxMessageCommand): Promise<ProcessWagerResult>;
   reprocessPendingReferences(options: PendingReferenceSweepOptions): Promise<PendingReferenceSweepResult>;
+  getWalletLedger(walletId: string, cursor: string | undefined, limit: number): Promise<WalletLedgerPage>;
+  reconcileWallet(walletId: string): Promise<WalletReconciliation>;
   getWallet(walletId: string): Promise<WalletView | null>;
   getTransaction(transactionId: string): Promise<TransactionView | null>;
   getProviderTransaction(providerId: string, externalTransactionId: string): Promise<TransactionView | null>;

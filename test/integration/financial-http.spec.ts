@@ -259,7 +259,12 @@ describe('CP2B-1-R1 HTTP end to end', () => {
     });
     const walletState = await call('GET', `/wallets/${wallet.id}`);
 
-    expect(rejected.status).toBe(200);
+    // CP4-R3 mandatory contract change: a durable REJECTED is answered with 422, not 200.
+    // CHALLENGE.md section 9 requires the HTTP status to be derived from the persisted status,
+    // so an unprocessable business outcome must be distinguishable from a processed one without
+    // parsing the body. Only the status line changed — the body assertions below are unchanged,
+    // and the balance/version assertions still prove the rejection had no financial effect.
+    expect(rejected.status).toBe(422);
     expect(rejected.body).toMatchObject({
       status: 'REJECTED',
       failureCode: 'INSUFFICIENT_BALANCE',
